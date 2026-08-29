@@ -49,7 +49,7 @@ class ToolRegistry:
         if tool is None:
             available = ", ".join(sorted(self._tools)) or "(none)"
             return f"Error: unknown tool '{call.name}'. Available: {available}"
-        if call.arguments_raw and not call.arguments:
+        if call.parse_error:
             return (
                 "Error: tool arguments were not valid JSON. "
                 f"Received: {call.arguments_raw[:500]}"

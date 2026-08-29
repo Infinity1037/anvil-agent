@@ -216,15 +216,26 @@ def _parse_tool_calls(raw: Any) -> list[ToolCall]:
 
 
 def _tool_call_from_parts(call_id: str, name: str, arguments_raw: str) -> ToolCall:
-    arguments: dict[str, Any]
-    raw = arguments_raw or "{}"
+    raw = arguments_raw if arguments_raw is not None else "{}"
     try:
-        loaded = json.loads(raw) if raw.strip() else {}
-        arguments = loaded if isinstance(loaded, dict) else {"_value": loaded}
+        loaded = json.loads(raw) if str(raw).strip() else {}
     except json.JSONDecodeError:
-        arguments = {}
-        raw = arguments_raw
-    return ToolCall(id=call_id, name=name, arguments=arguments, arguments_raw=raw)
+        return ToolCall(
+            id=call_id,
+            name=name,
+            arguments={},
+            arguments_raw=arguments_raw,
+            parse_error=True,
+        )
+    if not isinstance(loaded, dict):
+        return ToolCall(
+            id=call_id,
+            name=name,
+            arguments={},
+            arguments_raw=arguments_raw,
+            parse_error=True,
+        )
+    return ToolCall(id=call_id, name=name, arguments=loaded, arguments_raw=raw)
 
 
 def _parse_usage(raw: Any) -> Usage:

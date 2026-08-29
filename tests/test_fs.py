@@ -59,3 +59,29 @@ def test_path_escape_is_an_error(tmp_path: Path) -> None:
     out = _registry(tmp_path).execute(_call("read_file", path="../secret.txt"))
     assert out.startswith("Error:")
     assert "escapes" in out.lower()
+
+
+def test_empty_json_object_is_valid_for_optional_args(tmp_path: Path) -> None:
+    (tmp_path / "a.txt").write_text("x\n", encoding="utf-8")
+    out = _registry(tmp_path).execute(
+        ToolCall(id="c1", name="list_dir", arguments={}, arguments_raw="{}")
+    )
+    assert not out.startswith("Error:"), out
+    assert "a.txt" in out
+
+
+def test_invalid_json_arguments_are_reported() -> None:
+    from pathlib import Path
+
+    registry = _registry(Path("."))
+    out = registry.execute(
+        ToolCall(
+            id="c1",
+            name="list_dir",
+            arguments={},
+            arguments_raw="{",
+            parse_error=True,
+        )
+    )
+    assert out.startswith("Error:")
+    assert "JSON" in out

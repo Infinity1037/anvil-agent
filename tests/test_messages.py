@@ -15,6 +15,21 @@ def test_assistant_payload_keeps_reasoning_when_tools_are_used() -> None:
     assert payload["tool_calls"][0]["function"]["name"] == "read_file"
 
 
+def test_empty_object_arguments_are_not_parse_errors() -> None:
+    from anvil.llm.openai_compat import _tool_call_from_parts
+
+    call = _tool_call_from_parts("c1", "list_dir", "{}")
+    assert call.parse_error is False
+    assert call.arguments == {}
+
+
+def test_malformed_arguments_set_parse_error() -> None:
+    from anvil.llm.openai_compat import _tool_call_from_parts
+
+    call = _tool_call_from_parts("c1", "list_dir", "{")
+    assert call.parse_error is True
+
+
 def test_missing_reasoning_is_serialized_as_empty_string() -> None:
     message = Message(role="assistant", content="done")
     payload = message.to_openai(include_reasoning=True)

@@ -10,6 +10,7 @@ class ToolCall:
     name: str
     arguments: dict[str, Any]
     arguments_raw: str = ""
+    parse_error: bool = False
 
 
 @dataclass
