@@ -1,0 +1,93 @@
+from __future__ import annotations
+
+import os
+from dataclasses import dataclass
+from pathlib import Path
+
+
+def load_dotenv(path: Path) -> None:
+    """Load KEY=VALUE pairs without overwriting existing environment variables."""
+    if not path.is_file():
+        return
+    try:
+        text = path.read_text(encoding="utf-8")
+    except OSError:
+        return
+    for raw in text.splitlines():
+        line = raw.strip()
+        if not line or line.startswith("#") or "=" not in line:
+            continue
+        key, _, value = line.partition("=")
+        key = key.strip()
+        value = value.strip().strip("'").strip('"')
+        if key and key not in os.environ:
+            os.environ[key] = value
+
+
+def _truthy(value: str | None, default: bool) -> bool:
+    if value is None or value == "":
+        return default
+    return value.strip().lower() not in {"0", "false", "no", "off", "disabled"}
+
+
+@dataclass(frozen=True)
+class Config:
+    api_key: str
+    base_url: str
+    model: str
+    thinking: bool
+    reasoning_effort: str
+    max_turns: int
+    max_tokens: int
+    context_budget: int
+    request_timeout: float
+    shell_timeout: float
+    workspace: Path
+
+    @classmethod
+    def from_env(
+        cls,
+        workspace: Path,
+        *,
+        model: str | None = None,
+        thinking: bool | None = None,
+        reasoning_effort: str | None = None,
+        max_turns: int | None = None,
+    ) -> Config:
+        workspace = workspace.resolve()
+        load_dotenv(Path.cwd() / ".env")
+        load_dotenv(workspace / ".env")
+
+        api_key = (
+            os.environ.get("ANVIL_API_KEY")
+            or os.environ.get("DEEPSEEK_API_KEY")
+            or os.environ.get("OPENAI_API_KEY")
+            or ""
+        ).strip()
+        if not api_key:
+            raise ConfigError(
+                "Missing API key. Set DEEPSEEK_API_KEY (or ANVIL_API_KEY) "
+                "in the environment or a gitignored .env file."
+            )
+
+        effort = (reasoning_effort or os.environ.get("ANVIL_REASONING_EFFORT") or "high").lower()
+        if effort not in {"low", "high", "max"}:
+            raise ConfigError("ANVIL_REASONING_EFFORT must be low, high, or max.")
+
+        return cls(
+            api_key=api_key,
+            base_url=(os.environ.get("ANVIL_BASE_URL") or "https://api.deepseek.com").rstrip("/"),
+            model=model or os.environ.get("ANVIL_MODEL") or "deepseek-v4-flash",
+            thinking=_truthy(os.environ.get("ANVIL_THINKING"), True) if thinking is None else thinking,
+            reasoning_effort=effort,
+            max_turns=max_turns or int(os.environ.get("ANVIL_MAX_TURNS") or "40"),
+            max_tokens=int(os.environ.get("ANVIL_MAX_TOKENS") or "8192"),
+            context_budget=int(os.environ.get("ANVIL_CONTEXT_BUDGET") or "100000"),
+            request_timeout=float(os.environ.get("ANVIL_REQUEST_TIMEOUT") or "180"),
+            shell_timeout=float(os.environ.get("ANVIL_SHELL_TIMEOUT") or "60"),
+            workspace=workspace,
+        )
+
+
+class ConfigError(RuntimeError):
+    pass
