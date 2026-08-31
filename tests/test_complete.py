@@ -30,6 +30,8 @@ def test_slash_query_only_for_command_token() -> None:
 
 def test_match_slash_filters_and_includes_aliases() -> None:
     names = [item.value for item in match_slash("/") or []]
+    assert "compact" in names
+    assert "context" in names
     assert "help" in names
     assert "exit" in names
     assert "clear" in names

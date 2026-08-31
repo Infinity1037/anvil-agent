@@ -11,7 +11,8 @@ from textual.binding import Binding
 from textual.containers import VerticalScroll
 from textual.widgets import Static
 
-from anvil.agent.loop import Agent
+from anvil.agent.context import ContextSnapshot
+from anvil.agent.loop import Agent, CompactResult
 from anvil.events import AgentEvent
 from anvil.config import effort_label
 from anvil.agent.permissions import ApprovalDecision
@@ -41,7 +42,14 @@ from anvil.tui.complete import (
 )
 from anvil.session import Session, find_session, list_sessions
 from anvil.tui.widgets import AssistantBlock, FoldBlock, NoticeBlock, UserBlock
-from anvil.ui.format import STOP_LABELS, strip_internal, tool_message_ok
+from anvil.ui.format import (
+    STOP_LABELS,
+    compact_result_text,
+    context_badge,
+    context_report,
+    strip_internal,
+    tool_message_ok,
+)
 
 # Paint coalescing for live tokens. First chunk is immediate; later deltas
 # wait out the remainder of this window. Not a typewriter — the text is
@@ -425,6 +433,7 @@ class AnvilApp(App[None]):
         if name == "status":
             usage = self.agent.usage
             session = self.agent.session
+            snapshot = self._context_snapshot()
             log = self.query_one("#log", VerticalScroll)
             log.mount(
                 NoticeBlock(
@@ -432,16 +441,80 @@ class AnvilApp(App[None]):
                     f"{session.effort_status()}  {session.permission_status()}\n"
                     f"messages {len(self.agent.messages)}  "
                     f"session {session.id}\n"
-                    f"tokens {usage.prompt_tokens}+{usage.completion_tokens}\n"
+                    f"{context_badge(snapshot)}  "
+                    f"API tokens {usage.prompt_tokens}+{usage.completion_tokens}\n"
                     f"workspace {self.agent.config.workspace}"
                 )
             )
             log.scroll_end(animate=False)
             return True
+        if name == "context":
+            self._show_context()
+            return True
+        if name == "compact":
+            self._start_manual_compaction(arg)
+            return True
         if name == "help":
             self.action_show_help()
             return True
         return False
+
+    def _show_context(self) -> None:
+        log = self.query_one("#log", VerticalScroll)
+        log.mount(NoticeBlock(context_report(self._context_snapshot(), self.agent.usage)))
+        log.scroll_end(animate=False)
+
+    def _context_snapshot(self) -> ContextSnapshot:
+        getter = getattr(self.agent, "context_snapshot", None)
+        if callable(getter):
+            return getter()
+        messages = getattr(self.agent, "messages", [])
+        budget = int(getattr(self.agent.config, "context_budget", 100_000))
+        return ContextSnapshot(
+            estimated_tokens=0,
+            budget=budget,
+            history_messages=len(messages),
+            view_messages=len(messages),
+        )
+
+    def _start_manual_compaction(self, instruction: str) -> None:
+        log = self.query_one("#log", VerticalScroll)
+        log.mount(NoticeBlock("正在压缩上下文…  Esc/Ctrl+C 可取消"))
+        self._pin_bottom = True
+        self._disarm_quit()
+        self._set_busy(True)
+        log.scroll_end(animate=False)
+        self._run_manual_compaction(instruction)
+
+    @work(thread=True, exclusive=True)
+    def _run_manual_compaction(self, instruction: str) -> None:
+        self.agent.session.cancel.clear()
+        try:
+            result = self.agent.compact(
+                instruction,
+                on_event=self._bridge.push,
+                cancel=self.agent.session.cancel,
+            )
+        except Exception as exc:
+            result = CompactResult(
+                "failed",
+                0,
+                0,
+                error=f"{type(exc).__name__}: {exc}",
+            )
+        try:
+            self.call_from_thread(self._finish_manual_compaction, result)
+        except Exception:
+            pass
+
+    def _finish_manual_compaction(self, result: CompactResult) -> None:
+        self._bridge.flush()
+        if result.status != "compacted":
+            log = self.query_one("#log", VerticalScroll)
+            style = "bold red" if result.status == "failed" else "dim"
+            log.mount(NoticeBlock(compact_result_text(result), style=style))
+            log.scroll_end(animate=False)
+        self._set_busy(False)
 
     def _start_new_session(self) -> None:
         self.agent.new_session()
@@ -723,13 +796,15 @@ class AnvilApp(App[None]):
         try:
             widget = self.query_one("#status", Static)
             cfg = self.agent.config
+            width = widget.size.width or self.size.width
+            snapshot = self._context_snapshot()
             identity = session_header(
                 model=cfg.model,
                 effort=self._effort_id(),
                 perm=self._perm_id(),
                 workspace=cfg.workspace,
+                context=context_badge(snapshot, detailed=width >= 90),
             )
-            width = widget.size.width or self.size.width
             reason_open = False
             if self._approving:
                 try:
@@ -779,7 +854,25 @@ class AnvilApp(App[None]):
         elif kind == "tool_result":
             self._on_tool_result(log, payload)
         elif kind == "compact":
-            log.mount(NoticeBlock("已压缩较早的上下文（完整记录仍在本工作区会话文件中）"))
+            if payload.get("semantic"):
+                log.mount(
+                    NoticeBlock(
+                        compact_result_text(
+                            CompactResult(
+                                "compacted",
+                                int(payload.get("before_tokens") or 0),
+                                int(payload.get("after_tokens") or 0),
+                                int(payload.get("covered_count") or 0),
+                            )
+                        )
+                    )
+                )
+            else:
+                log.mount(
+                    NoticeBlock(
+                        "已折叠较早的上下文（完整记录仍在本工作区会话文件中）"
+                    )
+                )
         elif kind == "error":
             log.mount(NoticeBlock(str(payload.get("message") or "error"), style="bold red"))
         elif kind == "ended":

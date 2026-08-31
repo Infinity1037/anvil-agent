@@ -1,9 +1,11 @@
 import json
+import subprocess
+import sys
 from pathlib import Path
 
 from anvil.agent.context import ContextManager
 from anvil.config import Config
-from anvil.llm.types import Message, ToolCall
+from anvil.llm.types import Message, ToolCall, Usage
 from anvil.session import Session, find_session, latest_session, list_sessions
 
 
@@ -45,6 +47,17 @@ def test_session_persists_and_reloads(tmp_path: Path) -> None:
     assistant = next(item for item in loaded.messages if item.role == "assistant")
     assert assistant.reasoning_content == "greet"
     assert assistant.tool_calls and assistant.tool_calls[0].name == "list_dir"
+
+
+def test_session_module_imports_in_a_fresh_interpreter() -> None:
+    result = subprocess.run(
+        [sys.executable, "-c", "from anvil.session import Session; print(Session.__name__)"],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert result.returncode == 0, result.stderr
+    assert result.stdout.strip() == "Session"
 
 
 def test_list_sessions_is_workspace_local(tmp_path: Path) -> None:
@@ -117,6 +130,9 @@ def test_huge_tool_result_is_spilled_to_workspace(tmp_path: Path) -> None:
     assert saved.is_file()
     assert saved.read_text(encoding="utf-8") == blob
     assert blob not in stored or len(stored) < len(blob)
+    header, _, preview = stored.partition("\n\n")
+    assert "showing head and tail" in header
+    assert len(preview) <= 4_000
 
 
 def test_load_refreshes_stale_system_prompt_and_keeps_date(tmp_path: Path) -> None:
@@ -144,3 +160,33 @@ def test_load_refreshes_stale_system_prompt_and_keeps_date(tmp_path: Path) -> No
     disk = path.read_text(encoding="utf-8")
     assert "# Language" in disk
     assert "Date: 2026-01-15" in disk
+
+
+def test_compaction_checkpoint_persists_and_validates_source(tmp_path: Path) -> None:
+    session = Session(_config(tmp_path))
+    session.append(Message(role="user", content="large goal"))
+    session.append(Message(role="assistant", content="finding"))
+    item = session.save_compaction(
+        "Goal and finding",
+        3,
+        usage=Usage(prompt_tokens=20, completion_tokens=5, total_tokens=25),
+        model="scripted",
+    )
+    assert item is not None
+    loaded = Session.load(_config(tmp_path), session._log_path)
+    assert loaded.compaction is not None
+    assert loaded.compaction.summary == "Goal and finding"
+    assert loaded.compaction.covered_count == 3
+    assert loaded.compaction.prompt_tokens == 20
+
+
+def test_tampered_history_invalidates_compaction_checkpoint(tmp_path: Path) -> None:
+    session = Session(_config(tmp_path))
+    session.append(Message(role="user", content="original goal"))
+    session.append(Message(role="assistant", content="finding"))
+    assert session.save_compaction("summary", 3) is not None
+    path = session._log_path
+    text = path.read_text(encoding="utf-8").replace("original goal", "changed goal")
+    path.write_text(text, encoding="utf-8")
+    loaded = Session.load(_config(tmp_path), path)
+    assert loaded.compaction is None

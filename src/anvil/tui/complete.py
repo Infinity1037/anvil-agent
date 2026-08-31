@@ -9,6 +9,8 @@ from pathlib import Path
 SLASH_COMMANDS: tuple[tuple[str, str], ...] = (
     ("help", "键位与命令"),
     ("status", "模型、会话与 token"),
+    ("context", "查看当前上下文占用"),
+    ("compact", "压缩旧上下文，可附保留重点"),
     ("effort", "思考强度 off/low/high/max"),
     ("perm", "权限 ask/auto"),
     ("clear", "开始新会话"),

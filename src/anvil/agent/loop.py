@@ -2,9 +2,9 @@ from __future__ import annotations
 
 import json
 from dataclasses import dataclass, field
-from threading import Event
+from threading import Event, Lock
 
-from anvil.agent.context import ContextManager
+from anvil.agent.context import ContextManager, ContextSnapshot, normalize_summary
 from anvil.agent.permissions import ApprovalDecision, needs_ask
 from anvil.config import Config
 from anvil.events import AgentEvent, EventCallback, emit
@@ -16,6 +16,7 @@ from anvil.tools.result import ToolResult
 
 REPEAT_WARN = 3
 REPEAT_STOP = 5
+COMPACTION_OUTPUT_TOKENS = 4_096
 
 
 @dataclass
@@ -24,6 +25,15 @@ class RunResult:
     turns: int
     stop_reason: str
     usage: Usage = field(default_factory=Usage)
+
+
+@dataclass(frozen=True)
+class CompactResult:
+    status: str
+    before_tokens: int
+    after_tokens: int
+    covered_count: int = 0
+    error: str = ""
 
 
 class Agent:
@@ -44,6 +54,9 @@ class Agent:
         self.session = session or Session(config)
         self.approver = None
         self._repeat_counts: dict[str, int] = {}
+        self._compaction_attempts = 0
+        self._operation_lock = Lock()
+        self._restore_context_checkpoint()
 
     @property
     def messages(self) -> list[Message]:
@@ -53,12 +66,57 @@ class Agent:
     def usage(self) -> Usage:
         return self.session.usage
 
+    def context_snapshot(self) -> ContextSnapshot:
+        return self.context.snapshot(self.session.messages)
+
+    def compact(
+        self,
+        instruction: str = "",
+        on_event: EventCallback | None = None,
+        cancel: Event | None = None,
+    ) -> CompactResult:
+        """Manually compact at an idle boundary without adding a chat message."""
+        if not self._operation_lock.acquire(blocking=False):
+            current = self.context_snapshot().estimated_tokens
+            return CompactResult(
+                "busy",
+                current,
+                current,
+                error="wait for the active turn to finish",
+            )
+        flag = cancel or self.session.cancel
+        try:
+            flag.clear()
+            result = self._compact_once(
+                self.session.messages,
+                flag,
+                instruction=instruction,
+            )
+            if result.status == "compacted":
+                emit(
+                    on_event,
+                    "compact",
+                    {
+                        "before_tokens": result.before_tokens,
+                        "after_tokens": result.after_tokens,
+                        "covered_count": result.covered_count,
+                        "semantic": True,
+                        "trigger": "manual",
+                    },
+                )
+            return result
+        finally:
+            self._operation_lock.release()
+
     def new_session(self) -> None:
         self.session.start_new()
+        self.context.reset()
         self.reset_turn_state(clear_observer=True)
 
     def attach_session(self, session: Session) -> None:
         self.session = session
+        self.context.reset()
+        self._restore_context_checkpoint()
         self.reset_turn_state(clear_observer=True)
 
     def reset_turn_state(self, *, clear_observer: bool = False) -> None:
@@ -72,9 +130,19 @@ class Agent:
         on_event: EventCallback | None = None,
         cancel: Event | None = None,
     ) -> RunResult:
+        with self._operation_lock:
+            return self._run(task, on_event=on_event, cancel=cancel)
+
+    def _run(
+        self,
+        task: str,
+        on_event: EventCallback | None = None,
+        cancel: Event | None = None,
+    ) -> RunResult:
         flag = cancel or self.session.cancel
         flag.clear()
         self._repeat_counts = {}
+        self._compaction_attempts = 0
         self.session.append(Message(role="user", content=task))
         consecutive_errors = 0
 
@@ -83,14 +151,15 @@ class Agent:
                 return self._stop("cancelled", turn, "Stopped: cancelled.", on_event)
             emit(on_event, "turn", {"turn": turn, "max_turns": self.config.max_turns})
             log = self.session.messages
-            before_tokens = self.context.estimate(log)
-            view = self.context.prepare(log)
-            after_tokens = self.context.estimate(view)
-            if after_tokens < before_tokens:
-                emit(
+            view, context_status = self._prepare_model_view(log, on_event, flag)
+            if context_status == "cancelled":
+                return self._stop("cancelled", turn, "Stopped: cancelled.", on_event)
+            if view is None:
+                return self._stop(
+                    "context_overflow",
+                    turn,
+                    "Stopped: the current request is too large for the configured context budget.",
                     on_event,
-                    "compact",
-                    {"before_tokens": before_tokens, "after_tokens": after_tokens},
                 )
             try:
                 response = self.llm.complete(
@@ -189,6 +258,113 @@ class Agent:
             f"Stopped: reached max_turns={self.config.max_turns}.",
             on_event,
         )
+
+    def _prepare_model_view(
+        self,
+        log: list[Message],
+        on_event: EventCallback | None,
+        flag: Event | None,
+    ) -> tuple[list[Message] | None, str]:
+        before_tokens = self.context.snapshot(log).estimated_tokens
+        had_checkpoint = self.context.checkpoint is not None
+        view = self.context.prepare(log, preserve_history=True)
+        semantic = False
+
+        if self.context.should_compact(view) and self._compaction_attempts == 0:
+            self._compaction_attempts += 1
+            compacted = self._compact_once(log, flag)
+            if compacted.status == "cancelled":
+                return None, "cancelled"
+            if compacted.status == "compacted":
+                semantic = True
+                view = self.context.prepare(log, preserve_history=True)
+
+        if not self.context.fits(view):
+            view = self.context.prepare(log)
+        if not self.context.fits(view):
+            return None, "context_overflow"
+
+        after_tokens = self.context.estimate(view)
+        if semantic or (not had_checkpoint and after_tokens < before_tokens):
+            emit(
+                on_event,
+                "compact",
+                {
+                    "before_tokens": before_tokens,
+                    "after_tokens": after_tokens,
+                    "covered_count": (
+                        self.context.checkpoint[1] if self.context.checkpoint else 0
+                    ),
+                    "semantic": semantic,
+                    "trigger": "auto" if semantic else "cheap",
+                },
+            )
+        return view, "ok"
+
+    def _compact_once(
+        self,
+        log: list[Message],
+        flag: Event | None,
+        *,
+        instruction: str = "",
+    ) -> CompactResult:
+        before = self.context.snapshot(log).estimated_tokens
+        request = self.context.compaction_request(log, instruction=instruction)
+        if request is None:
+            return CompactResult("nothing_to_compact", before, before)
+        try:
+            response = self.llm.complete(
+                request.messages,
+                [],
+                stream=False,
+                thinking=False,
+                cancel=flag,
+                max_tokens=COMPACTION_OUTPUT_TOKENS,
+            )
+        except KeyboardInterrupt:
+            if flag is not None:
+                flag.set()
+            return CompactResult("cancelled", before, before)
+        except Exception as exc:
+            if type(exc).__name__ == "LLMCancelled" or _cancelled(flag):
+                return CompactResult("cancelled", before, before)
+            return CompactResult("failed", before, before, error=str(exc))
+
+        self.session.usage.add(response.usage)
+        if _cancelled(flag):
+            return CompactResult("cancelled", before, before)
+        if response.tool_calls:
+            return CompactResult(
+                "failed", before, before, error="summary returned tool calls"
+            )
+        if complete_without_tools(response.finish_reason) == "length":
+            return CompactResult("failed", before, before, error="summary was truncated")
+        summary = normalize_summary(response.content or "")
+        previous_covered = self.context.checkpoint[1] if self.context.checkpoint else 1
+        if not summary or request.covered_count <= previous_covered:
+            return CompactResult("failed", before, before, error="summary was empty or stale")
+
+        checkpoint = self.session.save_compaction(
+            summary,
+            request.covered_count,
+            usage=response.usage,
+            model=self.config.model,
+        )
+        if checkpoint is None:
+            return CompactResult("failed", before, before, error="checkpoint could not be saved")
+        self.context.restore_checkpoint(checkpoint.summary, checkpoint.covered_count)
+        after = self.context.snapshot(log).estimated_tokens
+        return CompactResult(
+            "compacted",
+            before,
+            after,
+            covered_count=checkpoint.covered_count,
+        )
+
+    def _restore_context_checkpoint(self) -> None:
+        item = getattr(self.session, "compaction", None)
+        if item is not None:
+            self.context.restore_checkpoint(item.summary, item.covered_count)
 
     def _execute_calls(self, calls: list[ToolCall], flag: Event | None) -> list[ToolResult]:
         mode = getattr(self.session, "permission_mode", "ask")

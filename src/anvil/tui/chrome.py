@@ -43,6 +43,8 @@ HELP_TEXT = """\
 命令
   /help          本说明
   /status        模型、会话与 token
+  /context       查看模型视图、预算与 checkpoint
+  /compact [重点] 手动压缩旧上下文
   /effort        选择思考强度（off / low / high / max）
   /perm          权限 ask（改前确认）/ auto（不问）
   /clear         开始新会话（工作区不变）
@@ -56,10 +58,21 @@ Esc 或 q 关闭
 WELCOME_TEXT = "会在当前工作区读文件、改代码、跑命令。/clear 新会话  ·  /effort 思考强度  ·  /perm 权限  ·  /resume 恢复  ·  键位见下方。"
 
 
-def session_header(*, model: str, effort: str, workspace: Path, perm: str = "ask") -> str:
+def session_header(
+    *,
+    model: str,
+    effort: str,
+    workspace: Path,
+    perm: str = "ask",
+    context: str = "",
+) -> str:
     cwd = Path(workspace)
     short = str(Path(*cwd.parts[-2:])) if len(cwd.parts) > 2 else str(cwd)
-    return f"Anvil  {model}  {effort}  {perm}  {short}"
+    fields = ["Anvil", model, effort, perm]
+    if context:
+        fields.append(context)
+    fields.append(short)
+    return "  ".join(fields)
 
 
 def status_plain(

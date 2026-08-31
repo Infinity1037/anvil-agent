@@ -6,6 +6,8 @@ from pathlib import Path
 from threading import Event
 from types import SimpleNamespace
 
+from anvil.agent.context import ContextSnapshot
+from anvil.agent.loop import CompactResult
 from anvil.config import apply_effort_token, effort_label
 from anvil.events import AgentEvent
 from anvil.tui.app import AnvilApp
@@ -89,6 +91,8 @@ class FakeAgent:
         self.usage = SimpleNamespace(prompt_tokens=0, completion_tokens=0)
         self.messages: list[object] = []
         self._script = script
+        self.compact_calls: list[str] = []
+        self.compact_result = CompactResult("nothing_to_compact", 1200, 1200)
 
     def reset(self) -> None:
         self.messages.clear()
@@ -105,6 +109,32 @@ class FakeAgent:
                 return
             if on_event:
                 on_event(AgentEvent(kind, payload))
+
+    def context_snapshot(self) -> ContextSnapshot:
+        return ContextSnapshot(
+            estimated_tokens=1200,
+            budget=20_000,
+            history_messages=len(self.messages),
+            view_messages=len(self.messages),
+            calibrated=True,
+        )
+
+    def compact(self, instruction="", on_event=None, cancel=None) -> CompactResult:
+        self.compact_calls.append(instruction)
+        if self.compact_result.status == "compacted" and on_event:
+            on_event(
+                AgentEvent(
+                    "compact",
+                    {
+                        "before_tokens": self.compact_result.before_tokens,
+                        "after_tokens": self.compact_result.after_tokens,
+                        "covered_count": self.compact_result.covered_count,
+                        "semantic": True,
+                        "trigger": "manual",
+                    },
+                )
+            )
+        return self.compact_result
 
 
 THINKING = (
@@ -222,7 +252,44 @@ async def _status_bar_is_visible_on_launch(tmp_path: Path) -> None:
         assert "展开" in plain
         assert "scripted" in plain
         assert "ask" in plain
+        assert "ctx" in plain
         assert list(app.query("#header")) == []
+
+
+def test_context_command_shows_budget_details(tmp_path: Path) -> None:
+    asyncio.run(_context_command_shows_budget_details(tmp_path))
+
+
+async def _context_command_shows_budget_details(tmp_path: Path) -> None:
+    app = AnvilApp(FakeAgent(tmp_path, []))
+    async with app.run_test(size=(110, 26)) as pilot:
+        _set_composer(app, "/context")
+        await pilot.press("enter")
+        await pilot.pause(0.05)
+        notices = [_plain(child) for child in app.query(NoticeBlock)]
+        assert any("context ≈6%" in text for text in notices)
+        assert any("20k" in text and "checkpoint not active" in text for text in notices)
+
+
+def test_compact_command_passes_focus_without_adding_chat_message(tmp_path: Path) -> None:
+    asyncio.run(_compact_command_passes_focus_without_adding_chat_message(tmp_path))
+
+
+async def _compact_command_passes_focus_without_adding_chat_message(tmp_path: Path) -> None:
+    agent = FakeAgent(tmp_path, [])
+    app = AnvilApp(agent)
+    async with app.run_test(size=(110, 26)) as pilot:
+        _set_composer(app, "/compact 保留测试结果")
+        await pilot.press("enter")
+        for _ in range(80):
+            if not app._busy:
+                break
+            await pilot.pause(0.05)
+        assert app._busy is False
+        assert agent.compact_calls == ["保留测试结果"]
+        assert agent.messages == []
+        notices = [_plain(child) for child in app.query(NoticeBlock)]
+        assert any("没有足够" in text for text in notices)
 
 
 def test_ctrl_o_expands_thinking_on_the_same_card(tmp_path: Path) -> None:

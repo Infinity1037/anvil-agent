@@ -198,3 +198,20 @@ def test_assistant_without_tools_never_sends_null_content() -> None:
     assert payload["content"] == ""
     assert "tool_calls" not in payload
     assert payload["reasoning_content"] == "hi"
+
+
+def test_per_call_max_tokens_override_is_used_for_compaction(tmp_path) -> None:
+    client = _client(tmp_path)
+    try:
+        payload = client._payload(
+            [Message(role="user", content="summarize")],
+            [],
+            stream=False,
+            thinking=False,
+            max_tokens=4096,
+        )
+        assert payload["max_tokens"] == 4096
+        assert payload["thinking"] == {"type": "disabled"}
+        assert "tools" not in payload
+    finally:
+        client.close()

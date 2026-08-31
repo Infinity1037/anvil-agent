@@ -13,6 +13,7 @@ from anvil.config import Config, ConfigError
 from anvil.llm.openai_compat import DeepSeekClient
 from anvil.session import Session, find_session, latest_session
 from anvil.tools import build_tools
+from anvil.ui.format import compact_result_text, context_badge, context_report
 from anvil.ui.prompt import read_user_line
 from anvil.ui.terminal import TerminalUI
 
@@ -207,6 +208,8 @@ def _repl(agent: Agent, ui: TerminalUI) -> int:
                 "Ctrl+O        reprint last turn's thinking/tool output below the prompt\n"
                 "/expand       same as Ctrl+O (if the shortcut is swallowed)\n"
                 "/status       model, session, tokens\n"
+                "/context      current model-view budget and checkpoint\n"
+                "/compact      compact old context; optional focus text\n"
                 "/effort       thinking intensity: off | low | high | max\n"
                 "/clear        start a new session in this workspace\n"
                 "/resume       list or restore a previous session\n"
@@ -254,12 +257,24 @@ def _repl(agent: Agent, ui: TerminalUI) -> int:
                 ui.console.print(f"[red]{exc}[/red]")
             continue
         if line == "/status":
+            snapshot = agent.context_snapshot()
             ui.console.print(
                 f"model {agent.config.model}  {agent.session.effort_status()}\n"
                 f"messages {len(agent.messages)}  "
-                f"tokens {agent.usage.prompt_tokens}+{agent.usage.completion_tokens}\n"
+                f"{context_badge(snapshot)}  "
+                f"API tokens {agent.usage.prompt_tokens}+{agent.usage.completion_tokens}\n"
                 f"workspace {agent.config.workspace}"
             )
+            continue
+        if line == "/context":
+            ui.console.print(context_report(agent.context_snapshot(), agent.usage))
+            continue
+        if line == "/compact" or line.startswith("/compact "):
+            instruction = line[len("/compact") :].strip()
+            ui.console.print("[dim]compacting context…  Ctrl+C to cancel[/dim]")
+            result = agent.compact(instruction, cancel=agent.session.cancel)
+            style = "red" if result.status == "failed" else "dim"
+            ui.console.print(compact_result_text(result), style=style)
             continue
         _run_once(agent, ui, line)
     return 0

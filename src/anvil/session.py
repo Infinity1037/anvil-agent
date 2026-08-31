@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import threading
@@ -34,6 +35,27 @@ class SessionInfo:
     messages: int
 
 
+@dataclass(frozen=True)
+class CompactionCheckpoint:
+    summary: str
+    covered_count: int
+    source_hash: str
+    prompt_tokens: int = 0
+    completion_tokens: int = 0
+    model: str = ""
+
+    def to_record(self) -> dict:
+        return {
+            "type": "compaction",
+            "summary": self.summary,
+            "covered_count": self.covered_count,
+            "source_hash": self.source_hash,
+            "prompt_tokens": self.prompt_tokens,
+            "completion_tokens": self.completion_tokens,
+            "model": self.model,
+        }
+
+
 class Session:
     """Owns conversation history. The model sees a compacted view; this log stays complete.
 
@@ -51,6 +73,7 @@ class Session:
         self.reasoning_effort = config.reasoning_effort
         self.permission_mode = "ask"
         self.session_allow: set[str] = set()
+        self.compaction: CompactionCheckpoint | None = None
         self._created = datetime.now(timezone.utc).isoformat()
         self.messages: list[Message] = [
             Message(role="system", content=build_system_prompt(config.workspace))
@@ -71,9 +94,10 @@ class Session:
         session.reasoning_effort = config.reasoning_effort
         session.permission_mode = "ask"
         session.session_allow = set()
+        session.compaction = None
         session._created = _header_created(path)
         session.messages = []
-        meta_id, messages, settings = read_session_file(path)
+        meta_id, messages, settings, compaction = _read_session_data(path)
         if meta_id:
             session.id = meta_id
         if "thinking" in settings:
@@ -90,6 +114,7 @@ class Session:
                 session.messages.insert(
                     0, Message(role="system", content=build_system_prompt(config.workspace))
                 )
+        session.compaction = _valid_compaction(compaction, session.messages)
         session._refresh_system()
         return session
 
@@ -102,6 +127,7 @@ class Session:
         self.reasoning_effort = self.config.reasoning_effort
         self.permission_mode = "ask"
         self.session_allow = set()
+        self.compaction = None
         self.id = _new_id()
         self._created = datetime.now(timezone.utc).isoformat()
         self._log_path = sessions_dir(self.config.workspace) / f"{self.id}.jsonl"
@@ -140,6 +166,29 @@ class Session:
     def allow_tool(self, name: str) -> None:
         if name:
             self.session_allow.add(name)
+
+    def save_compaction(
+        self,
+        summary: str,
+        covered_count: int,
+        *,
+        usage: Usage | None = None,
+        model: str = "",
+    ) -> CompactionCheckpoint | None:
+        if not summary.strip() or covered_count <= 1 or covered_count > len(self.messages):
+            return None
+        item = CompactionCheckpoint(
+            summary=summary.strip(),
+            covered_count=covered_count,
+            source_hash=_messages_hash(self.messages, covered_count),
+            prompt_tokens=(usage.prompt_tokens if usage else 0),
+            completion_tokens=(usage.completion_tokens if usage else 0),
+            model=model,
+        )
+        if not self._append_json(item.to_record()):
+            return None
+        self.compaction = item
+        return item
 
     def permission_status(self) -> str:
         return f"perm {self.permission_mode}"
@@ -185,6 +234,8 @@ class Session:
                     "permission_mode": self.permission_mode,
                 },
             ]
+            if self.compaction is not None:
+                rows.append(self.compaction.to_record())
             with tmp.open("w", encoding="utf-8") as handle:
                 for payload in rows:
                     handle.write(json.dumps(payload, ensure_ascii=False) + "\n")
@@ -219,7 +270,7 @@ class Session:
             }
         )
 
-    def _append_json(self, payload: dict) -> None:
+    def _append_json(self, payload: dict) -> bool:
         try:
             self._log_path.parent.mkdir(parents=True, exist_ok=True)
             line = json.dumps(payload, ensure_ascii=False) + "\n"
@@ -228,7 +279,8 @@ class Session:
                 handle.flush()
                 os.fsync(handle.fileno())
         except OSError:
-            return
+            return False
+        return True
 
 
 def _header_created(path: Path) -> str:
@@ -244,13 +296,21 @@ def _header_created(path: Path) -> str:
 
 
 def read_session_file(path: Path) -> tuple[str | None, list[Message], dict]:
+    meta_id, messages, settings, _compaction = _read_session_data(path)
+    return meta_id, messages, settings
+
+
+def _read_session_data(
+    path: Path,
+) -> tuple[str | None, list[Message], dict, list[CompactionCheckpoint]]:
     meta_id: str | None = None
     messages: list[Message] = []
     settings: dict = {}
+    compactions: list[CompactionCheckpoint] = []
     try:
         text = path.read_text(encoding="utf-8")
     except OSError:
-        return None, [], {}
+        return None, [], {}, []
     for raw in text.splitlines():
         line = raw.strip()
         if not line:
@@ -274,10 +334,60 @@ def read_session_file(path: Path) -> tuple[str | None, list[Message], dict]:
             if mode in {"ask", "auto"}:
                 settings["permission_mode"] = mode
             continue
+        if payload.get("type") == "compaction":
+            item = _checkpoint_from_record(payload)
+            if item is not None:
+                compactions.append(item)
+            continue
         message = Message.from_record(payload)
         if message is not None:
             messages.append(message)
-    return meta_id or None, messages, settings
+    return meta_id or None, messages, settings, compactions
+
+
+def _checkpoint_from_record(payload: dict) -> CompactionCheckpoint | None:
+    summary = payload.get("summary")
+    source_hash = payload.get("source_hash")
+    try:
+        covered_count = int(payload.get("covered_count") or 0)
+        prompt_tokens = int(payload.get("prompt_tokens") or 0)
+        completion_tokens = int(payload.get("completion_tokens") or 0)
+    except (TypeError, ValueError):
+        return None
+    if not isinstance(summary, str) or not summary.strip():
+        return None
+    if not isinstance(source_hash, str) or not source_hash:
+        return None
+    return CompactionCheckpoint(
+        summary=summary.strip(),
+        covered_count=covered_count,
+        source_hash=source_hash,
+        prompt_tokens=max(0, prompt_tokens),
+        completion_tokens=max(0, completion_tokens),
+        model=str(payload.get("model") or ""),
+    )
+
+
+def _valid_compaction(
+    candidates: list[CompactionCheckpoint], messages: list[Message]
+) -> CompactionCheckpoint | None:
+    for item in reversed(candidates):
+        if item.covered_count <= 1 or item.covered_count > len(messages):
+            continue
+        if item.source_hash == _messages_hash(messages, item.covered_count):
+            return item
+    return None
+
+
+def _messages_hash(messages: list[Message], covered_count: int) -> str:
+    rows = [message.to_record() for message in messages[1:covered_count]]
+    encoded = json.dumps(
+        rows,
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+    ).encode("utf-8")
+    return hashlib.sha256(encoded).hexdigest()
 
 
 def list_sessions(workspace: Path) -> list[SessionInfo]:

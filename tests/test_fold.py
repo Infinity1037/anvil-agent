@@ -1,3 +1,6 @@
+from anvil.agent.context import ContextSnapshot
+from anvil.agent.loop import CompactResult
+from anvil.llm.types import Usage
 from anvil.tui.chrome import footer_text, status_plain
 from anvil.tui.fold import (
     THINKING_PREVIEW,
@@ -15,6 +18,32 @@ from anvil.tui.markdown import (
 )
 from anvil.tui.widgets import _thinking_text, render_user
 from anvil.events import AgentEvent
+from anvil.ui.format import compact_result_text, context_badge, context_report, short_tokens
+
+
+def test_context_display_derives_live_ratio_from_token_counts() -> None:
+    snapshot = ContextSnapshot(
+        estimated_tokens=42_000,
+        budget=100_000,
+        history_messages=30,
+        view_messages=12,
+        covered_count=18,
+        calibrated=True,
+    )
+    assert context_badge(snapshot) == "ctx ≈42% (42k/100k)"
+    report = context_report(snapshot, Usage(prompt_tokens=128_400, completion_tokens=9_700))
+    assert "remaining ≈58k" in report
+    assert "30 full / 12 active" in report
+    assert "checkpoint covers 17 historical" in report
+    assert "128.4k input / 9.7k output" in report
+    assert short_tokens(1_250_000) == "1.2m"
+
+
+def test_compaction_result_text_is_observable_without_exposing_summary() -> None:
+    text = compact_result_text(CompactResult("compacted", 62_100, 13_400, 34))
+    assert "≈62.1k → 13.4k" in text
+    assert "33" in text
+    assert "完整历史" in text
 
 
 def test_live_thinking_shows_tail_under_spinner() -> None:

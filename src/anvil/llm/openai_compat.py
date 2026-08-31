@@ -83,6 +83,7 @@ class DeepSeekClient:
         thinking: bool | None = None,
         reasoning_effort: str | None = None,
         cancel: Event | None = None,
+        max_tokens: int | None = None,
     ) -> LLMResponse:
         body = self._payload(
             messages,
@@ -90,6 +91,7 @@ class DeepSeekClient:
             stream=stream,
             thinking=thinking,
             reasoning_effort=reasoning_effort,
+            max_tokens=max_tokens,
         )
         last_error: Exception | None = None
         for attempt in range(5):
@@ -135,6 +137,7 @@ class DeepSeekClient:
         stream: bool,
         thinking: bool | None = None,
         reasoning_effort: str | None = None,
+        max_tokens: int | None = None,
     ) -> dict[str, Any]:
         use_thinking = self.config.thinking if thinking is None else thinking
         effort = self.config.reasoning_effort if reasoning_effort is None else reasoning_effort
@@ -145,7 +148,7 @@ class DeepSeekClient:
             "messages": [
                 m.to_openai(include_reasoning=include_reasoning) for m in messages
             ],
-            "max_tokens": self.config.max_tokens,
+            "max_tokens": self.config.max_tokens if max_tokens is None else max_tokens,
             "stream": stream,
             "thinking": {"type": "enabled" if use_thinking else "disabled"},
         }
