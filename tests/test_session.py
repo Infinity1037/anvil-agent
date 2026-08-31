@@ -61,6 +61,17 @@ def test_list_sessions_is_workspace_local(tmp_path: Path) -> None:
     assert find_session(other, first.id) is None
 
 
+def test_find_session_rejects_an_external_jsonl_path(tmp_path: Path) -> None:
+    workspace = tmp_path / "workspace"
+    other = tmp_path / "other"
+    workspace.mkdir()
+    other.mkdir()
+    external = Session(_config(other))
+    external.append(Message(role="user", content="outside conversation"))
+
+    assert find_session(workspace, str(external._log_path)) is None
+
+
 def test_start_new_writes_a_second_file(tmp_path: Path) -> None:
     session = Session(_config(tmp_path))
     session.append(Message(role="user", content="first"))

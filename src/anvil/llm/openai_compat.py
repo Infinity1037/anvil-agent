@@ -24,6 +24,21 @@ class LLMCancelled(LLMError):
     pass
 
 
+class LLMStreamInterrupted(LLMError):
+    def __init__(self, message: str, *, partial: bool) -> None:
+        super().__init__(message)
+        self.partial = partial
+
+
+def _wait_before_retry(attempt: int, cancel: Event | None) -> None:
+    delay = min(2**attempt, 16)
+    if cancel is None:
+        time.sleep(delay)
+        return
+    if cancel.wait(delay):
+        raise LLMCancelled("cancelled")
+
+
 class DeepSeekClient:
     """OpenAI-compatible Chat Completions client tuned for DeepSeek V4.
 
@@ -86,13 +101,19 @@ class DeepSeekClient:
                 return self._complete_once(body)
             except LLMCancelled:
                 raise
+            except LLMStreamInterrupted as exc:
+                if exc.partial or attempt >= 4:
+                    raise
+                last_error = exc
+                _wait_before_retry(attempt, cancel)
+                continue
             except LLMError:
                 raise
             except httpx.HTTPStatusError as exc:
                 status = exc.response.status_code
                 if status in {429, 500, 502, 503, 504} and attempt < 4:
-                    time.sleep(min(2**attempt, 16))
                     last_error = exc
+                    _wait_before_retry(attempt, cancel)
                     continue
                 detail = _response_detail(exc.response)
                 raise LLMError(f"LLM HTTP {status}: {detail}") from exc
@@ -100,8 +121,8 @@ class DeepSeekClient:
                 if cancel is not None and cancel.is_set():
                     raise LLMCancelled("cancelled") from exc
                 if attempt < 4:
-                    time.sleep(min(2**attempt, 16))
                     last_error = exc
+                    _wait_before_retry(attempt, cancel)
                     continue
                 raise LLMError(f"LLM request failed: {exc}") from exc
         raise LLMError(f"LLM request failed after retries: {last_error}")
@@ -177,59 +198,80 @@ class DeepSeekClient:
         call_slots: dict[int, dict[str, str]] = {}
         usage = Usage()
         finish_reason: str | None = None
+        saw_terminal = False
+        saw_payload = False
         if response.status_code >= 400:
             response.read()
             raise httpx.HTTPStatusError(
                 "error", request=response.request, response=response
             )
-        for line in response.iter_lines():
+        try:
+            for line in response.iter_lines():
+                if cancel is not None and cancel.is_set():
+                    raise LLMCancelled("cancelled")
+                if not line:
+                    continue
+                if line.startswith(":"):
+                    continue
+                if not line.startswith("data:"):
+                    continue
+                data = line[5:].strip()
+                if data == "[DONE]":
+                    saw_terminal = True
+                    break
+                try:
+                    chunk = json.loads(data)
+                except json.JSONDecodeError:
+                    continue
+                if chunk.get("usage"):
+                    usage = parse_usage(chunk["usage"])
+                choices = chunk.get("choices") or []
+                if not choices:
+                    continue
+                choice = choices[0]
+                finish_reason = choice.get("finish_reason") or finish_reason
+                if finish_reason:
+                    saw_terminal = True
+                delta = choice.get("delta") or {}
+                reasoning = delta.get("reasoning_content")
+                if reasoning is None:
+                    reasoning = delta.get("reasoning")
+                if reasoning:
+                    saw_payload = True
+                    reasoning_parts.append(reasoning)
+                    if on_delta:
+                        on_delta("reasoning", reasoning)
+                text = delta.get("content")
+                if text:
+                    saw_payload = True
+                    content_parts.append(text)
+                    if on_delta:
+                        on_delta("content", text)
+                raw_calls = delta.get("tool_calls") or []
+                if raw_calls:
+                    saw_payload = True
+                for raw_call in raw_calls:
+                    index = int(raw_call.get("index") or 0)
+                    slot = call_slots.setdefault(
+                        index, {"id": "", "name": "", "arguments": ""}
+                    )
+                    if raw_call.get("id"):
+                        slot["id"] = raw_call["id"]
+                    function = raw_call.get("function") or {}
+                    if function.get("name"):
+                        slot["name"] += function["name"]
+                    if function.get("arguments"):
+                        slot["arguments"] += function["arguments"]
+        except (httpx.TimeoutException, httpx.TransportError, httpx.StreamError) as exc:
             if cancel is not None and cancel.is_set():
-                raise LLMCancelled("cancelled")
-            if not line:
-                continue
-            if line.startswith(":"):
-                continue
-            if not line.startswith("data:"):
-                continue
-            data = line[5:].strip()
-            if data == "[DONE]":
-                break
-            try:
-                chunk = json.loads(data)
-            except json.JSONDecodeError:
-                continue
-            if chunk.get("usage"):
-                usage = parse_usage(chunk["usage"])
-            choices = chunk.get("choices") or []
-            if not choices:
-                continue
-            choice = choices[0]
-            finish_reason = choice.get("finish_reason") or finish_reason
-            delta = choice.get("delta") or {}
-            reasoning = delta.get("reasoning_content")
-            if reasoning is None:
-                reasoning = delta.get("reasoning")
-            if reasoning:
-                reasoning_parts.append(reasoning)
-                if on_delta:
-                    on_delta("reasoning", reasoning)
-            text = delta.get("content")
-            if text:
-                content_parts.append(text)
-                if on_delta:
-                    on_delta("content", text)
-            for raw_call in delta.get("tool_calls") or []:
-                index = int(raw_call.get("index") or 0)
-                slot = call_slots.setdefault(
-                    index, {"id": "", "name": "", "arguments": ""}
-                )
-                if raw_call.get("id"):
-                    slot["id"] = raw_call["id"]
-                function = raw_call.get("function") or {}
-                if function.get("name"):
-                    slot["name"] += function["name"]
-                if function.get("arguments"):
-                    slot["arguments"] += function["arguments"]
+                raise LLMCancelled("cancelled") from exc
+            raise LLMStreamInterrupted(
+                "LLM stream interrupted before completion.", partial=saw_payload
+            ) from exc
+        if not saw_terminal:
+            raise LLMStreamInterrupted(
+                "LLM stream ended before completion.", partial=saw_payload
+            )
 
         tool_calls = [
             parse_tool_call(

@@ -1,9 +1,16 @@
-from threading import Event
+import time
+from threading import Event, Timer
 
+import httpx
 import pytest
 
+import anvil.llm.openai_compat as openai_compat
 from anvil.config import Config
-from anvil.llm.openai_compat import DeepSeekClient, LLMCancelled
+from anvil.llm.openai_compat import (
+    DeepSeekClient,
+    LLMCancelled,
+    LLMStreamInterrupted,
+)
 from anvil.llm.types import Message
 
 
@@ -17,6 +24,12 @@ class _FakeStream:
 
     def read(self) -> bytes:
         return b""
+
+
+class _InterruptedStream(_FakeStream):
+    def iter_lines(self):
+        yield 'data: {"choices":[{"delta":{"content":"partial"}}]}'
+        raise httpx.ReadError("connection dropped")
 
 
 def _client(tmp_path) -> DeepSeekClient:
@@ -88,6 +101,93 @@ def test_read_stream_raises_when_cancelled(tmp_path) -> None:
         with pytest.raises(LLMCancelled):
             client._read_stream(_FakeStream(["data: {}"]), on_delta=None, cancel=cancel)
     finally:
+        client.close()
+
+
+def test_partial_stream_interruption_is_not_retryable(tmp_path, monkeypatch) -> None:
+    client = _client(tmp_path)
+    attempts = 0
+
+    def interrupted(*_args, **_kwargs):
+        nonlocal attempts
+        attempts += 1
+        return client._read_stream(_InterruptedStream([]), on_delta=None, cancel=None)
+
+    monkeypatch.setattr(client, "_complete_stream", interrupted)
+    try:
+        with pytest.raises(LLMStreamInterrupted) as caught:
+            client.complete([], [], stream=True)
+        assert caught.value.partial is True
+        assert attempts == 1
+    finally:
+        client.close()
+
+
+def test_stream_without_a_terminal_event_is_rejected(tmp_path) -> None:
+    client = _client(tmp_path)
+    try:
+        with pytest.raises(LLMStreamInterrupted) as caught:
+            client._read_stream(
+                _FakeStream(['data: {"choices":[{"delta":{"content":"partial"}}]}']),
+                on_delta=None,
+                cancel=None,
+            )
+        assert caught.value.partial is True
+    finally:
+        client.close()
+
+
+def test_empty_interrupted_stream_is_retried(tmp_path, monkeypatch) -> None:
+    client = _client(tmp_path)
+    attempts = 0
+
+    def complete_stream(*_args, **_kwargs):
+        nonlocal attempts
+        attempts += 1
+        if attempts == 1:
+            return client._read_stream(_FakeStream([]), on_delta=None, cancel=None)
+        return client._read_stream(
+            _FakeStream(
+                [
+                    'data: {"choices":[{"delta":{"content":"recovered"},"finish_reason":"stop"}]}',
+                    "data: [DONE]",
+                ]
+            ),
+            on_delta=None,
+            cancel=None,
+        )
+
+    monkeypatch.setattr(client, "_complete_stream", complete_stream)
+    monkeypatch.setattr(openai_compat, "_wait_before_retry", lambda *_args: None)
+    try:
+        response = client.complete([], [], stream=True)
+        assert response.content == "recovered"
+        assert attempts == 2
+    finally:
+        client.close()
+
+
+def test_cancel_interrupts_retry_backoff(tmp_path, monkeypatch) -> None:
+    client = _client(tmp_path)
+    cancel = Event()
+    attempts = 0
+
+    def unavailable(_body):
+        nonlocal attempts
+        attempts += 1
+        raise httpx.ConnectError("offline")
+
+    monkeypatch.setattr(client, "_complete_once", unavailable)
+    timer = Timer(0.05, cancel.set)
+    started = time.monotonic()
+    timer.start()
+    try:
+        with pytest.raises(LLMCancelled):
+            client.complete([], [], stream=False, cancel=cancel)
+        assert time.monotonic() - started < 0.5
+        assert attempts == 1
+    finally:
+        timer.cancel()
         client.close()
 
 

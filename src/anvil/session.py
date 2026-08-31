@@ -309,9 +309,6 @@ def find_session(workspace: Path, token: str) -> SessionInfo | None:
     matches = [info for info in infos if info.id.startswith(token)]
     if len(matches) == 1:
         return matches[0]
-    path = Path(token)
-    if path.is_file():
-        return _session_info(path)
     return None
 
 

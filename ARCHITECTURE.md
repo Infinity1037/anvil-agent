@@ -24,12 +24,12 @@ loop:
 | 层 | 职责 |
 |----|------|
 | `cli` / `tui` / `ui` | 解析参数、订阅事件、渲染终端。默认全屏 TUI：思考/工具卡片可原位展开（Ctrl+O）。回答流式与定稿同一套 Markdown。ask 确认条停靠输入区，Ctrl+E 看全文。`--plain` / `--once` / 非 TTY 走逐行打印。不执行工具。 |
-| `session` | 拥有完整对话历史。落在工作区 `.anvil/sessions/`，可 `/resume` 或 `anvil --continue` 读回。Agent 只跑内层循环。 |
+| `session` | 拥有完整对话历史。落在工作区 `.anvil/sessions/`，只按本工作区列出的会话 ID / 唯一前缀恢复。Agent 只跑内层循环。 |
 | `agent.loop` | 内层工具循环：无 tool_calls / 截断 / cancel / max_turns / 连续失败 / 无进展时结束。 |
 | `agent.permissions` | TUI 默认 `ask`：edit/write/shell 执行前确认；`--once`/`--plain` 默认 `auto`。安全黑名单仍单独生效。 |
 | `agent.prompts` | 会话开始时组装一次 system 消息：静态规则在前，环境与工作区 `ANVIL.md`/`AGENTS.md` 在后。项目文件不能覆盖系统规则。 |
 | `agent.context` | `prepare(log)` 只生成 view，不改 log；发出去前补齐/丢掉不成对的 tool 消息；token 用最近一次 usage 校准字符比；过大工具结果先落到 `.anvil/tool-output/`，再占位、丢中间轮。 |
-| `llm` | DeepSeek Chat Completions + 流式聚合。畸形 tool_calls 在解析层丢掉或标 `parse_error`，不抛给循环。 |
+| `llm` | DeepSeek Chat Completions + 流式聚合。退避等待可取消；空流可重试，已有部分响应的中断不重试。畸形 tool_calls 在解析层丢掉或标 `parse_error`，不抛给循环。 |
 | `tools` | Schema、本地执行、`ToolResult` + 稳定错误码、Never-throw。 |
 | `safety` | 文件/搜索路径约束、密钥文件、shell 明显密钥引用与危险命令黑名单（约定信任，不是 OS 沙箱）。 |
 

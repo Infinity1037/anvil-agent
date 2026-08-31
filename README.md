@@ -41,11 +41,11 @@ anvil --once --workspace examples/broken_ledger "Make the tests pass"
 - `/resume` 恢复本工作区历史会话；启动可用 `anvil --continue`
 - `/exit` 或 `Ctrl+Q` 退出（`/quit` 仍可用）
 
-全屏会话结束后，终端滚动区不会留下本次对话；记录在工作区 `.anvil/transcripts/`。若需要旧的逐行打印（Ctrl+O 会在输入框下面重打全文），加 `--plain`。
+全屏会话结束后，终端滚动区不会留下本次对话；记录在工作区 `.anvil/sessions/`。若需要旧的逐行打印（Ctrl+O 会在输入框下面重打全文），加 `--plain`。
 
 ## 安装
 
-需要 Python 3.10+（推荐 3.11）。
+需要 Python 3.11+。
 
 ```powershell
 py -3.11 -m venv .venv
@@ -59,7 +59,7 @@ copy .env.example .env
 Linux / macOS：
 
 ```bash
-python3 -m venv .venv
+python3.11 -m venv .venv
 source .venv/bin/activate
 pip install -e ".[dev]"
 cp .env.example .env
@@ -108,7 +108,7 @@ pytest
 
 单元测试使用 ScriptedLLM，不访问网络、不消耗额度。`examples/broken_ledger` 是一个测试会失败的小账本，用来演示真实修 bug 流程。
 
-更完整的分层说明见 [ARCHITECTURE.md](ARCHITECTURE.md)。协作规范、模块地图和当前进度见 [docs/dev/](docs/dev/README.md)。
+更完整的分层说明见 [ARCHITECTURE.md](ARCHITECTURE.md)。
 
 ## 设计取舍
 
@@ -120,4 +120,4 @@ pytest
 - **命令失败不是成功。** 非零退出带 `command_failed` 返回；超时或取消会终止 shell 进程树。完整大输出交给上下文层落盘后再裁剪模型视图。
 - **无进展检测。** 连续三次完全相同的工具调用会在结果里插入换策略提醒，避免空转。
 
-会话记录写在工作区 `.anvil/transcripts/`（已 gitignore）。
+会话记录写在工作区 `.anvil/sessions/`（已 gitignore）。
