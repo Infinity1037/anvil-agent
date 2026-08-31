@@ -17,7 +17,23 @@ from anvil.ui.prompt import read_user_line
 from anvil.ui.terminal import TerminalUI
 
 
+def _ensure_utf8_output() -> None:
+    """Keep redirected and legacy Windows output from crashing on Unicode."""
+    for stream in (sys.stdout, sys.stderr):
+        encoding = (getattr(stream, "encoding", "") or "").lower().replace("_", "-")
+        if encoding in {"utf-8", "utf8"}:
+            continue
+        reconfigure = getattr(stream, "reconfigure", None)
+        if not callable(reconfigure):
+            continue
+        try:
+            reconfigure(encoding="utf-8", errors="replace")
+        except (OSError, ValueError):
+            pass
+
+
 def main(argv: list[str] | None = None) -> int:
+    _ensure_utf8_output()
     parser = argparse.ArgumentParser(
         prog="anvil",
         description="Anvil — a local coding agent.",

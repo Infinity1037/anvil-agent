@@ -23,7 +23,7 @@ loop:
 
 | 层 | 职责 |
 |----|------|
-| `cli` / `tui` / `ui` | 解析参数、订阅事件、渲染终端。默认全屏 TUI：思考/工具卡片可原位展开（Ctrl+O）。回答流式与定稿同一套 Markdown。ask 确认条停靠输入区，Ctrl+E 看全文。`--plain` / `--once` / 非 TTY 走逐行打印。不执行工具。 |
+| `cli` / `tui` / `ui` | 解析参数、订阅事件、渲染终端。默认全屏 TUI：思考/工具卡片可原位展开（Ctrl+O）。回答流式与定稿同一套 Markdown。ask 确认条停靠输入区，Ctrl+E 看全文。`--plain` / `--once` / 非 TTY 走逐行打印，输出统一为 UTF-8，避免 Windows GBK/重定向终端遇到源码 Unicode 字符时崩溃。不执行工具。 |
 | `session` | 拥有完整对话历史。落在工作区 `.anvil/sessions/`，只按本工作区列出的会话 ID / 唯一前缀恢复。Agent 只跑内层循环。 |
 | `agent.loop` | 内层工具循环：无 tool_calls / 截断 / cancel / max_turns / 连续失败 / 无进展时结束。 |
 | `agent.permissions` | TUI 默认 `ask`：edit/write/shell 执行前确认；`--once`/`--plain` 默认 `auto`。安全黑名单仍单独生效。 |
