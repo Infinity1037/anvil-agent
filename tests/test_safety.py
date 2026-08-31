@@ -7,6 +7,7 @@ from anvil.safety import (
     InternalPathError,
     PathEscapeError,
     SecretFileError,
+    assert_command_has_no_secret_reference,
     assert_not_internal,
     assert_not_secret,
     assert_safe_command,
@@ -37,10 +38,18 @@ def test_anvil_session_dir_is_blocked(tmp_path: Path) -> None:
 
 
 def test_secret_files_are_blocked(tmp_path: Path) -> None:
-    env = tmp_path / ".env"
-    env.write_text("KEY=1\n", encoding="utf-8")
+    for name in (".env", ".env.staging", ".envrc", "private.pem", "signing.key"):
+        with pytest.raises(SecretFileError):
+            assert_not_secret(tmp_path / name)
+    assert_not_secret(tmp_path / ".env.example")
+
+
+def test_secret_references_in_shell_commands_are_blocked() -> None:
     with pytest.raises(SecretFileError):
-        assert_not_secret(env)
+        assert_command_has_no_secret_reference("Get-Content ./config/.env.local")
+    with pytest.raises(SecretFileError):
+        assert_command_has_no_secret_reference("cat keys/private.pem")
+    assert_command_has_no_secret_reference("copy .env.example .env.template")
 
 
 def test_dangerous_shell_commands_are_blocked() -> None:

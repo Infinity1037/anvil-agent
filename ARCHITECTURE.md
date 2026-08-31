@@ -31,17 +31,19 @@ loop:
 | `agent.context` | `prepare(log)` 只生成 view，不改 log；发出去前补齐/丢掉不成对的 tool 消息；token 用最近一次 usage 校准字符比；过大工具结果先落到 `.anvil/tool-output/`，再占位、丢中间轮。 |
 | `llm` | DeepSeek Chat Completions + 流式聚合。畸形 tool_calls 在解析层丢掉或标 `parse_error`，不抛给循环。 |
 | `tools` | Schema、本地执行、`ToolResult` + 稳定错误码、Never-throw。 |
-| `safety` | 工作区路径约束、密钥文件、危险命令黑名单（约定信任，不是 OS 沙箱）。 |
+| `safety` | 文件/搜索路径约束、密钥文件、shell 明显密钥引用与危险命令黑名单（约定信任，不是 OS 沙箱）。 |
 
 ## 工具
 
 `list_dir` `glob` `grep` `read_file` `write_file` `edit_file` `run_shell` `todo`
 
-- 失败返回 `ToolResult(ok=false, error_code, hint)`，不靠 `"Error:"` 前缀猜。错误码包括 `unknown_tool`、`invalid_json`、`missing_arguments`、`path_escape`、`secret_file`、`dangerous_command`、`stale_read`、`not_unique`、`not_found` 等。
+- 失败返回 `ToolResult(ok=false, error_code, hint)`，不靠 `"Error:"` 前缀猜。错误码包括 `unknown_tool`、`invalid_json`、`missing_arguments`、`path_escape`、`secret_file`、`dangerous_command`、`command_failed`、`command_timeout`、`stale_read`、`not_unique`、`not_found` 等。
 - `read_file` 记下文件摘要；`edit_file` 与覆盖写必须先读且摘要未变，否则 `stale_read`。
 - `edit_file`：精确唯一替换；0 次 / 多次匹配返回可恢复错误；成功时附 unified diff。
 - `write_file`：默认拒绝覆盖已有文件。
 - `read_file`：带行号，大文件强制 offset/limit。
+- `glob` / `grep`：跳过密钥文件和越出工作区的文件链接；模板型 `.env.example` 可见。
+- `run_shell`：子进程不继承典型凭据环境变量；非零退出是 `command_failed`；超时/取消在 Unix 杀进程组，在 Windows 关闭带 `KILL_ON_JOB_CLOSE` 的 Job Object。大输出不在 shell 层提前丢失。
 - 未知参数键会被丢掉，不传给 handler。
 
 ## DeepSeek

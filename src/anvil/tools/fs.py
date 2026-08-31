@@ -3,7 +3,12 @@ from __future__ import annotations
 import difflib
 from pathlib import Path
 
-from anvil.safety import assert_not_internal, assert_not_secret, resolve_in_workspace
+from anvil.safety import (
+    assert_not_internal,
+    assert_not_secret,
+    is_secret_path,
+    resolve_in_workspace,
+)
 from anvil.tools.base import ToolSpec
 from anvil.tools.observe import FileObserver
 from anvil.tools.result import ToolResult
@@ -45,6 +50,7 @@ def _numbered(lines: list[str], start_line: int) -> str:
 def make_list_dir(workspace: Path) -> ToolSpec:
     def list_dir(path: str = ".") -> ToolResult:
         target = resolve_in_workspace(workspace, path)
+        assert_not_secret(target)
         assert_not_internal(target, workspace)
         if not target.exists():
             return ToolResult.fail("not_found", f"path not found: {path}")
@@ -52,7 +58,11 @@ def make_list_dir(workspace: Path) -> ToolSpec:
             return ToolResult.fail("not_a_directory", f"not a directory: {path}")
         skip = {".git", ".anvil", "__pycache__", ".venv", "venv", ".pytest_cache", "node_modules"}
         entries = sorted(
-            (item for item in target.iterdir() if item.name not in skip),
+            (
+                item
+                for item in target.iterdir()
+                if item.name not in skip and not is_secret_path(item)
+            ),
             key=lambda p: (not p.is_dir(), p.name.lower()),
         )
         if not entries:

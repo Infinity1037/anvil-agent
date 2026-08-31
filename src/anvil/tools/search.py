@@ -5,7 +5,12 @@ import os
 import re
 from pathlib import Path
 
-from anvil.safety import assert_not_internal, resolve_in_workspace
+from anvil.safety import (
+    SecretFileError,
+    assert_not_internal,
+    assert_not_secret,
+    resolve_in_workspace,
+)
 from anvil.tools.base import ToolSpec
 from anvil.tools.result import ToolResult
 
@@ -41,12 +46,29 @@ SKIP_DIRS = {
 }
 
 
-def _iter_files(root: Path, glob_pattern: str | None):
+def _searchable_file(path: Path, workspace: Path) -> bool:
+    try:
+        resolved = path.resolve()
+        resolved.relative_to(workspace.resolve())
+        assert_not_secret(path)
+        assert_not_secret(resolved)
+    except (OSError, SecretFileError, ValueError):
+        return False
+    return True
+
+
+def _iter_files(root: Path, glob_pattern: str | None, workspace: Path):
     for dirpath, dirnames, filenames in os.walk(root):
-        dirnames[:] = [name for name in dirnames if name not in SKIP_DIRS]
         current = Path(dirpath)
+        dirnames[:] = [
+            name
+            for name in dirnames
+            if name not in SKIP_DIRS and not (current / name).is_symlink()
+        ]
         for name in filenames:
             path = current / name
+            if not _searchable_file(path, workspace):
+                continue
             if glob_pattern and not _glob_match(glob_pattern, path, root):
                 continue
             yield path
@@ -61,9 +83,10 @@ def make_glob(workspace: Path) -> ToolSpec:
         if not root.exists():
             return ToolResult.fail("not_found", f"path not found: {path}")
         if root.is_file():
+            assert_not_secret(root)
             root = root.parent
         matches: list[str] = []
-        for file_path in _iter_files(root, None):
+        for file_path in _iter_files(root, None, workspace):
             rel = file_path.relative_to(workspace).as_posix()
             if not _glob_match(pattern, file_path, workspace) and not _glob_match(pattern, file_path, root):
                 continue
@@ -111,6 +134,8 @@ def make_grep(workspace: Path) -> ToolSpec:
         assert_not_internal(root, workspace)
         if not root.exists():
             return ToolResult.fail("not_found", f"path not found: {path}")
+        if root.is_file():
+            assert_not_secret(root)
         try:
             regex = re.compile(pattern)
         except re.error as exc:
@@ -120,7 +145,7 @@ def make_grep(workspace: Path) -> ToolSpec:
         except (TypeError, ValueError):
             return ToolResult.fail("bad_arguments", "max_matches must be an integer.")
         hits: list[str] = []
-        files = [root] if root.is_file() else _iter_files(root, glob)
+        files = [root] if root.is_file() else _iter_files(root, glob, workspace)
         scanned = 0
         for file_path in files:
             scanned += 1
@@ -145,7 +170,10 @@ def make_grep(workspace: Path) -> ToolSpec:
 
     return ToolSpec(
         name="grep",
-        description="Search file contents with a Python regular expression. Prefer this over shell grep. Skips git/venv/node_modules.",
+        description=(
+            "Search non-secret file contents with a Python regular expression. "
+            "Prefer this over shell grep. Skips git/venv/node_modules."
+        ),
         parameters={
             "type": "object",
             "properties": {

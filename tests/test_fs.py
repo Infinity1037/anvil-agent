@@ -72,6 +72,17 @@ def test_write_and_list(tmp_path: Path) -> None:
     assert "hello.py" in listed
 
 
+def test_list_hides_secret_files_but_keeps_templates(tmp_path: Path) -> None:
+    (tmp_path / ".env").write_text("TOKEN=live\n", encoding="utf-8")
+    (tmp_path / ".env.example").write_text("TOKEN=template\n", encoding="utf-8")
+
+    listed = _registry(tmp_path).execute(_call("list_dir", path="."))
+
+    assert listed.ok is True
+    assert ".env.example" in listed.content
+    assert "\nfile  .env " not in f"\n{listed.content}"
+
+
 def test_write_refuses_overwrite_without_flag(tmp_path: Path) -> None:
     registry = _registry(tmp_path)
     registry.execute(_call("write_file", path="a.txt", content="one\n"))
