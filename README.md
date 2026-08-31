@@ -7,14 +7,41 @@ Anvil 是一个运行在本机工作区上的编程智能体。模型只负责�
 ## 它做什么
 
 - 在指定工作区里自主探索并修改代码
-- 用精确字符串替换编辑已有文件（匹配必须唯一）
-- 执行测试和命令，根据输出继续改
-- 截断过大的工具结果，并在上下文接近预算时压缩早期输出
+- 用精确字符串替换编辑已有文件（匹配必须唯一，成功后返回 unified diff）
+- `write_file` 默认拒绝覆盖已有文件，避免整文件误伤
+- 执行测试和命令，根据输出继续改；同一调用第三次提醒换策略，第五次停止
+- 截断过大的工具结果；压缩只作用于发给模型的视图，JSONL 保留完整轨迹
 - 把路径限制在工作区内，拒绝明显危险的命令
 
+默认是**全屏终端会话**（做完一件事还可以追问）。思考链和工具输出默认只显示预览，**Ctrl+O 在原来的卡片上展开/收起**，不会在输入框下面再打印一份。也可以只跑一次就退出。
+
 ```
+# 进入对话（推荐）
+anvil --workspace examples/broken_ledger
+
+# 先做一件事，做完后仍停在聊天里，可以继续说「再加测试」「解释你改了什么」
 anvil --workspace examples/broken_ledger "Make the tests pass. Run python -m unittest -v"
+
+# 脚本/录屏：做完一件事立刻退出
+anvil --once --workspace examples/broken_ledger "Make the tests pass"
 ```
+
+会话里可以输入：
+
+- 普通中文/英文，当作下一轮任务（历史、工作区、todo 都保留）
+- `Ctrl+O` 在思考链 / 工具卡片**原位**展开或收起（再按一次收起）
+- `Enter` 发送，`Shift+Enter` 换行
+- `/` 弹出命令补全（按前缀过滤：help / status / effort / perm / clear / resume / expand / exit）
+- `@` 弹出工作区文件补全
+- `?` 或 `F1` 打开键位说明（输入框为空时）
+- `/status` 看模型、思考强度、会话与 token
+- `/effort` 弹出思考强度选择（off / low / high / max）；当前档位显示在底栏
+- `/perm` 或 `Shift+Tab` 切换权限：`ask` 在改文件和跑命令前确认，`auto` 不问（`--once` / `--plain` 默认 auto）。确认条只展示摘要，Ctrl+E 看全文，Tab 可写拒绝原因
+- `/clear` 开始新会话（`/new` 仍可用）
+- `/resume` 恢复本工作区历史会话；启动可用 `anvil --continue`
+- `/exit` 或 `Ctrl+Q` 退出（`/quit` 仍可用）
+
+全屏会话结束后，终端滚动区不会留下本次对话；记录在工作区 `.anvil/transcripts/`。若需要旧的逐行打印（Ctrl+O 会在输入框下面重打全文），加 `--plain`。
 
 ## 安装
 
@@ -46,11 +73,13 @@ cp .env.example .env
 | `ANVIL_BASE_URL` | `https://api.deepseek.com` | OpenAI 兼容网关 |
 | `ANVIL_MODEL` | `deepseek-v4-flash` | 模型 id，可改为 `deepseek-v4-pro` |
 | `ANVIL_THINKING` | `1` | 是否开启思考模式 |
-| `ANVIL_REASONING_EFFORT` | `high` | `low` / `high` / `max` |
+| `ANVIL_REASONING_EFFORT` | `max` | `low` / `high` / `max`；复杂 Agent 默认最强思考 |
+| `ANVIL_MAX_TOKENS` | `256000` | 单次请求输出上限（含思考链） |
+| `ANVIL_REQUEST_TIMEOUT` | `300` | 流式空闲超时（秒） |
 | `ANVIL_MAX_TURNS` | `40` | 最大循环轮次 |
 | `ANVIL_CONTEXT_BUDGET` | `100000` | 触发压缩的估算 token 预算 |
 
-命令行：`anvil --model deepseek-v4-flash --effort high --workspace . "your task"`。不带任务参数则进入 REPL（`/reset`、`/quit`）。
+命令行：`anvil --workspace .` 进入全屏对话；后面可以跟一句首条任务。`--once` 表示只跑这一次。`--plain` 关闭全屏 TUI。`--effort low|high|max` 覆盖启动时的思考强度。`--continue` 恢复本工作区最近一次会话。`/status` `/effort` `/clear` `/resume` `/exit` 是会话内命令。
 
 工作区根目录若存在 `ANVIL.md` 或 `AGENTS.md`，会注入 system prompt。
 
@@ -79,12 +108,15 @@ pytest
 
 单元测试使用 ScriptedLLM，不访问网络、不消耗额度。`examples/broken_ledger` 是一个测试会失败的小账本，用来演示真实修 bug 流程。
 
+更完整的分层说明见 [ARCHITECTURE.md](ARCHITECTURE.md)。协作规范、模块地图和当前进度见 [docs/dev/](docs/dev/README.md)。
+
 ## 设计取舍
 
 - **原生 tool calling，而不是自己解析 XML。** 参数是 JSON Schema，少一次脆弱的文本解析。
 - **专用文件工具 + shell，而不是只给一个 bash。** `edit_file` 能校验替换次数；搜索工具避免把整仓塞进上下文；Windows 上也不依赖 Unix 工具链。
-- **精确替换而不是整文件覆盖。** 匹配 0 次或多次都返回可操作的错误，让模型重读后再改。
-- **上下文廉价优先压缩。** 先截断单次工具输出，再折叠早期结果。窗口即使是 1M，测试日志也能把它撑满。
+- **精确替换而不是整文件覆盖。** 匹配 0 次或多次都返回可操作的错误，让模型重读后再改；写文件默认不能覆盖。
+- **上下文廉价优先压缩。** 先截断单次工具输出，再折叠早期结果。发给模型的是视图，磁盘上的 transcript 仍是全文。
 - **工具永不把进程打崩。** 异常变成带提示的字符串，交给模型下一轮自愈。
+- **无进展检测。** 连续三次完全相同的工具调用会在结果里插入换策略提醒，避免空转。
 
 会话记录写在工作区 `.anvil/transcripts/`（已 gitignore）。
