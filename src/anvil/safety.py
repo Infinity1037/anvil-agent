@@ -27,6 +27,10 @@ class SecretFileError(ValueError):
     pass
 
 
+class InternalPathError(ValueError):
+    pass
+
+
 class DangerousCommandError(ValueError):
     pass
 
@@ -49,6 +53,15 @@ def assert_not_secret(path: Path) -> None:
     name = path.name.lower()
     if name in SECRET_NAMES or path.suffix.lower() in SECRET_SUFFIXES:
         raise SecretFileError(f"Refusing to read or write secret file: {path.name}")
+
+
+def assert_not_internal(path: Path, workspace: Path) -> None:
+    try:
+        relative = path.resolve().relative_to(workspace.resolve())
+    except ValueError:
+        return
+    if relative.parts and relative.parts[0] == ".anvil":
+        raise InternalPathError(".anvil holds session logs, not project source.")
 
 
 def assert_safe_command(command: str) -> None:

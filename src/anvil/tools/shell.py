@@ -3,10 +3,17 @@ from __future__ import annotations
 import os
 import shutil
 import subprocess
+import time
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
+from typing import TYPE_CHECKING
 
-from anvil.safety import DangerousCommandError, assert_safe_command
+from anvil.safety import InternalPathError, assert_safe_command
 from anvil.tools.base import ToolSpec
+from anvil.tools.result import ToolResult
+
+if TYPE_CHECKING:
+    from anvil.tools.base import ToolRegistry
 
 
 def detect_shell() -> tuple[str, list[str]]:
@@ -19,49 +26,91 @@ def detect_shell() -> tuple[str, list[str]]:
     return "sh", ["sh", "-c"]
 
 
-def make_run_shell(workspace: Path, timeout: float) -> ToolSpec:
+def _mentions_anvil(command: str) -> bool:
+    normalized = command.replace("\\", "/")
+    return "/.anvil/" in f"/{normalized}" or normalized.strip().startswith(".anvil")
+
+
+def _stop_process(proc: subprocess.Popen) -> None:
+    try:
+        proc.kill()
+    except OSError:
+        pass
+    try:
+        proc.communicate(timeout=2)
+    except Exception:
+        pass
+
+
+def make_run_shell(
+    workspace: Path,
+    timeout: float,
+    registry: ToolRegistry | None = None,
+) -> ToolSpec:
     shell_name, prefix = detect_shell()
 
-    def run_shell(command: str) -> str:
+    def run_shell(command: str) -> ToolResult:
         if not command or not command.strip():
-            return "Error: command must not be empty."
+            return ToolResult.fail("empty_query", "command must not be empty.")
+        assert_safe_command(command)
+        if _mentions_anvil(command):
+            raise InternalPathError(".anvil holds session logs, not project source.")
+        env = os.environ.copy()
+        env.setdefault("PYTHONUTF8", "1")
+        env.setdefault("PYTHONIOENCODING", "utf-8")
         try:
-            assert_safe_command(command)
-        except DangerousCommandError as exc:
-            return f"Error: {exc}"
-        try:
-            completed = subprocess.run(
+            proc = subprocess.Popen(
                 prefix + [command],
                 cwd=workspace,
-                capture_output=True,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
                 text=True,
-                timeout=timeout,
-                env=os.environ.copy(),
-            )
-        except subprocess.TimeoutExpired as exc:
-            partial = ((exc.stdout or "") + (exc.stderr or "")).strip()
-            tail = partial[-2000:] if partial else "(no output captured)"
-            return (
-                f"Error: command timed out after {timeout:.0f}s.\n"
-                f"Partial output:\n{tail}\n"
-                "Tip: avoid interactive prompts; chain commands with && because cwd resets each call."
+                encoding="utf-8",
+                errors="replace",
+                env=env,
             )
         except OSError as exc:
-            return f"Error: failed to start shell ({shell_name}): {exc}"
-
-        stdout = completed.stdout or ""
-        stderr = completed.stderr or ""
+            return ToolResult.fail(
+                "exception",
+                f"failed to start shell ({shell_name}): {exc}",
+            )
+        deadline = time.monotonic() + timeout
+        with ThreadPoolExecutor(max_workers=1) as pool:
+            waiter = pool.submit(proc.communicate)
+            while not waiter.done():
+                cancel = None if registry is None else registry.cancel
+                if cancel is not None and cancel.is_set():
+                    _stop_process(proc)
+                    try:
+                        waiter.result(timeout=2)
+                    except Exception:
+                        pass
+                    return ToolResult.fail("cancelled", f"cancelled: {command}")
+                if time.monotonic() > deadline:
+                    _stop_process(proc)
+                    try:
+                        waiter.result(timeout=2)
+                    except Exception:
+                        pass
+                    return ToolResult.fail(
+                        "command_timeout",
+                        f"command timed out after {timeout:.0f}s.\n$ {command}",
+                        hint="Avoid interactive prompts; chain commands because cwd resets each call.",
+                    )
+                time.sleep(0.05)
+            stdout, stderr = waiter.result()
         body = "".join(
             part
             for part in (
-                f"exit_code: {completed.returncode}\n",
+                f"$ {command}\n",
+                f"exit_code: {proc.returncode}\n",
                 f"stdout:\n{stdout}" if stdout else "stdout: (empty)\n",
                 f"stderr:\n{stderr}" if stderr else "",
             )
         ).rstrip()
         if len(body) > 20_000:
             body = body[:12_000] + "\n...[truncated]...\n" + body[-6_000:]
-        return body
+        return ToolResult.success(body)
 
     return ToolSpec(
         name="run_shell",

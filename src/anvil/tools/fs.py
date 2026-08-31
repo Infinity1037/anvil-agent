@@ -1,17 +1,37 @@
 from __future__ import annotations
 
+import difflib
 from pathlib import Path
 
-from anvil.safety import (
-    PathEscapeError,
-    SecretFileError,
-    assert_not_secret,
-    resolve_in_workspace,
-)
+from anvil.safety import assert_not_internal, assert_not_secret, resolve_in_workspace
 from anvil.tools.base import ToolSpec
+from anvil.tools.observe import FileObserver
+from anvil.tools.result import ToolResult
 
 MAX_READ_BYTES = 200_000
 DEFAULT_LINE_LIMIT = 400
+
+
+def _read_text(path: Path) -> str:
+    with path.open("r", encoding="utf-8", newline="") as handle:
+        return handle.read()
+
+
+def _write_text(path: Path, content: str) -> None:
+    with path.open("w", encoding="utf-8", newline="") as handle:
+        handle.write(content)
+
+
+def unified_diff(path: str, before: str, after: str, context: int = 3) -> str:
+    diff = difflib.unified_diff(
+        before.splitlines(),
+        after.splitlines(),
+        fromfile=f"a/{path}",
+        tofile=f"b/{path}",
+        lineterm="",
+        n=context,
+    )
+    return "\n".join(diff)
 
 
 def _numbered(lines: list[str], start_line: int) -> str:
@@ -23,15 +43,20 @@ def _numbered(lines: list[str], start_line: int) -> str:
 
 
 def make_list_dir(workspace: Path) -> ToolSpec:
-    def list_dir(path: str = ".") -> str:
+    def list_dir(path: str = ".") -> ToolResult:
         target = resolve_in_workspace(workspace, path)
+        assert_not_internal(target, workspace)
         if not target.exists():
-            return f"Error: path not found: {path}"
+            return ToolResult.fail("not_found", f"path not found: {path}")
         if not target.is_dir():
-            return f"Error: not a directory: {path}"
-        entries = sorted(target.iterdir(), key=lambda p: (not p.is_dir(), p.name.lower()))
+            return ToolResult.fail("not_a_directory", f"not a directory: {path}")
+        skip = {".git", ".anvil", "__pycache__", ".venv", "venv", ".pytest_cache", "node_modules"}
+        entries = sorted(
+            (item for item in target.iterdir() if item.name not in skip),
+            key=lambda p: (not p.is_dir(), p.name.lower()),
+        )
         if not entries:
-            return f"(empty directory) {path}"
+            return ToolResult.success(f"(empty directory) {path}")
         lines = []
         for item in entries[:500]:
             kind = "dir " if item.is_dir() else "file"
@@ -39,11 +64,11 @@ def make_list_dir(workspace: Path) -> ToolSpec:
             lines.append(f"{kind}  {item.name}{size}")
         if len(entries) > 500:
             lines.append(f"... {len(entries) - 500} more entries omitted")
-        return "\n".join(lines)
+        return ToolResult.success("\n".join(lines))
 
     return ToolSpec(
         name="list_dir",
-        description="List files and directories in a workspace path.",
+        description="List files and directories in a workspace path. Prefer this over shell ls/dir.",
         parameters={
             "type": "object",
             "properties": {
@@ -59,41 +84,56 @@ def make_list_dir(workspace: Path) -> ToolSpec:
     )
 
 
-def make_read_file(workspace: Path) -> ToolSpec:
-    def read_file(path: str, offset: int | None = None, limit: int | None = None) -> str:
+def make_read_file(workspace: Path, observer: FileObserver | None = None) -> ToolSpec:
+    def read_file(path: str, offset: int | None = None, limit: int | None = None) -> ToolResult:
         target = resolve_in_workspace(workspace, path)
         assert_not_secret(target)
+        assert_not_internal(target, workspace)
         if not target.exists():
-            return f"Error: file not found: {path}"
+            return ToolResult.fail("not_found", f"file not found: {path}")
         if target.is_dir():
-            return f"Error: '{path}' is a directory. Use list_dir."
+            return ToolResult.fail(
+                "not_a_file",
+                f"'{path}' is a directory. Use list_dir.",
+            )
         size = target.stat().st_size
         if size > MAX_READ_BYTES and offset is None and limit is None:
-            return (
-                f"Error: file is {size} bytes. Use offset and limit to read a slice "
-                f"(about {DEFAULT_LINE_LIMIT} lines per call)."
+            return ToolResult.fail(
+                "file_too_large",
+                f"file is {size} bytes. Use offset and limit to read a slice "
+                f"(about {DEFAULT_LINE_LIMIT} lines per call).",
             )
         try:
-            text = target.read_text(encoding="utf-8")
+            text = _read_text(target)
         except UnicodeDecodeError:
-            return f"Error: '{path}' is not valid UTF-8 text."
+            return ToolResult.fail("not_utf8", f"'{path}' is not valid UTF-8 text.")
+        except OSError as exc:
+            return ToolResult.fail("exception", str(exc))
+        if observer is not None:
+            observer.remember(target, text)
         lines = text.splitlines()
         total = len(lines)
-        start = 1 if offset is None else int(offset)
+        try:
+            start = 1 if offset is None else int(offset)
+            count = DEFAULT_LINE_LIMIT if limit is None else int(limit)
+        except (TypeError, ValueError):
+            return ToolResult.fail("bad_arguments", "offset and limit must be integers.")
         if start < 1:
-            return "Error: offset is 1-based and must be >= 1."
+            return ToolResult.fail("offset_invalid", "offset is 1-based and must be >= 1.")
         if start > total + 1:
-            return f"Error: offset {start} is past end of file ({total} lines)."
-        count = DEFAULT_LINE_LIMIT if limit is None else int(limit)
+            return ToolResult.fail(
+                "offset_invalid",
+                f"offset {start} is past end of file ({total} lines).",
+            )
         if count < 1:
-            return "Error: limit must be >= 1."
+            return ToolResult.fail("offset_invalid", "limit must be >= 1.")
         chunk = lines[start - 1 : start - 1 + count]
         rendered = _numbered(chunk, start)
         remaining = total - (start - 1 + len(chunk))
         header = f"{path} ({total} lines)"
         if remaining > 0:
             header += f" — showing {len(chunk)} lines, {remaining} more after this slice"
-        return header + "\n" + rendered
+        return ToolResult.success(header + "\n" + rendered)
 
     return ToolSpec(
         name="read_file",
@@ -121,28 +161,65 @@ def make_read_file(workspace: Path) -> ToolSpec:
     )
 
 
-def make_write_file(workspace: Path) -> ToolSpec:
-    def write_file(path: str, content: str) -> str:
+def make_write_file(workspace: Path, observer: FileObserver | None = None) -> ToolSpec:
+    def write_file(path: str, content: str, overwrite: bool = False) -> ToolResult:
         target = resolve_in_workspace(workspace, path)
         assert_not_secret(target)
+        assert_not_internal(target, workspace)
         if target.exists() and target.is_dir():
-            return f"Error: '{path}' is a directory."
-        target.parent.mkdir(parents=True, exist_ok=True)
-        target.write_text(content, encoding="utf-8", newline="\n")
+            return ToolResult.fail("not_a_file", f"'{path}' is a directory.")
+        existed = target.exists()
+        if existed and not overwrite:
+            return ToolResult.fail(
+                "already_exists",
+                f"{path} already exists. Use edit_file for a surgical change, "
+                "or pass overwrite=true to replace the entire file.",
+            )
+        before = ""
+        if existed:
+            try:
+                before = _read_text(target)
+            except UnicodeDecodeError:
+                return ToolResult.fail("not_utf8", f"'{path}' is not valid UTF-8 text.")
+            except OSError as exc:
+                return ToolResult.fail("write_failed", str(exc))
+            if observer is not None:
+                blocked = observer.check_against(target, before)
+                if blocked is not None:
+                    return blocked
+        try:
+            target.parent.mkdir(parents=True, exist_ok=True)
+            _write_text(target, content)
+        except OSError as exc:
+            return ToolResult.fail("write_failed", str(exc))
+        if observer is not None:
+            observer.remember(target, content)
         lines = content.count("\n") + (0 if content.endswith("\n") or content == "" else 1)
-        return f"Wrote {len(content.encode('utf-8'))} bytes ({lines} lines) to {path}"
+        header = (
+            f"Wrote {len(content.encode('utf-8'))} bytes ({lines} lines) to {path}"
+            + (" (overwrote existing file)." if existed else ".")
+        )
+        if existed:
+            diff = unified_diff(path, before, content)
+            if diff:
+                return ToolResult.success(header + "\n" + diff)
+        return ToolResult.success(header)
 
     return ToolSpec(
         name="write_file",
         description=(
-            "Create or overwrite a UTF-8 text file. Prefer edit_file for existing files "
-            "when a small replacement is enough."
+            "Create a UTF-8 text file. Refuses to overwrite unless overwrite=true. "
+            "Prefer edit_file for existing files."
         ),
         parameters={
             "type": "object",
             "properties": {
                 "path": {"type": "string", "description": "File path relative to the workspace."},
                 "content": {"type": "string", "description": "Full file contents to write."},
+                "overwrite": {
+                    "type": "boolean",
+                    "description": "Replace the file if it already exists. Default false.",
+                },
             },
             "required": ["path", "content"],
         },
@@ -151,33 +228,62 @@ def make_write_file(workspace: Path) -> ToolSpec:
     )
 
 
-def make_edit_file(workspace: Path) -> ToolSpec:
-    def edit_file(path: str, old_string: str, new_string: str) -> str:
+def make_edit_file(workspace: Path, observer: FileObserver | None = None) -> ToolSpec:
+    def edit_file(path: str, old_string: str, new_string: str) -> ToolResult:
         if old_string == new_string:
-            return "Error: old_string and new_string are identical."
+            return ToolResult.fail(
+                "identical_edit",
+                "old_string and new_string are identical.",
+            )
         if old_string == "":
-            return "Error: old_string must not be empty. Use write_file to create a new file."
+            return ToolResult.fail(
+                "empty_old_string",
+                "old_string must not be empty. Use write_file to create a new file.",
+            )
         target = resolve_in_workspace(workspace, path)
         assert_not_secret(target)
+        assert_not_internal(target, workspace)
         if not target.exists():
-            return f"Error: file not found: {path}. Use write_file to create it."
+            return ToolResult.fail(
+                "not_found",
+                f"file not found: {path}. Use write_file to create it.",
+            )
         if target.is_dir():
-            return f"Error: '{path}' is a directory."
-        text = target.read_text(encoding="utf-8")
+            return ToolResult.fail("not_a_file", f"'{path}' is a directory.")
+        try:
+            text = _read_text(target)
+        except UnicodeDecodeError:
+            return ToolResult.fail("not_utf8", f"'{path}' is not valid UTF-8 text.")
+        except OSError as exc:
+            return ToolResult.fail("exception", str(exc))
+        if observer is not None:
+            blocked = observer.check_against(target, text)
+            if blocked is not None:
+                return blocked
         matches = text.count(old_string)
         if matches == 0:
-            return (
-                f"Error: old_string was not found in {path} "
-                f"({len(text.splitlines())} lines). "
-                "Read the file and copy the exact text, including whitespace."
+            return ToolResult.fail(
+                "no_match",
+                f"old_string was not found in {path} ({len(text.splitlines())} lines). "
+                "Read the file and copy the exact text, including whitespace.",
+                hint="Call read_file and copy the exact span to replace.",
             )
         if matches > 1:
-            return (
-                f"Error: old_string matched {matches} locations in {path}. "
-                "Include more surrounding lines so the replacement is unique."
+            return ToolResult.fail(
+                "not_unique",
+                f"old_string matched {matches} locations in {path}. "
+                "Include more surrounding lines so the replacement is unique.",
+                hint="Add surrounding lines so the match occurs exactly once.",
             )
-        target.write_text(text.replace(old_string, new_string, 1), encoding="utf-8", newline="\n")
-        return f"Edited {path} (1 replacement)."
+        updated = text.replace(old_string, new_string, 1)
+        try:
+            _write_text(target, updated)
+        except OSError as exc:
+            return ToolResult.fail("write_failed", str(exc))
+        if observer is not None:
+            observer.remember(target, updated)
+        diff = unified_diff(path, text, updated)
+        return ToolResult.success(f"Edited {path} (1 replacement).\n{diff}")
 
     return ToolSpec(
         name="edit_file",
@@ -200,11 +306,3 @@ def make_edit_file(workspace: Path) -> ToolSpec:
         handler=edit_file,
         parallel_safe=False,
     )
-
-
-def explain_fs_error(exc: Exception) -> str:
-    if isinstance(exc, PathEscapeError):
-        return f"Error: {exc}"
-    if isinstance(exc, SecretFileError):
-        return f"Error: {exc}"
-    return f"Error: {type(exc).__name__}: {exc}"

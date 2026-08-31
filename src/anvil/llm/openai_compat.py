@@ -3,18 +3,24 @@ from __future__ import annotations
 import json
 import time
 from collections.abc import Callable
+from threading import Event
 from typing import Any
 
 import httpx
 
 from anvil.config import Config
-from anvil.llm.types import LLMResponse, Message, ToolCall, Usage
+from anvil.llm.parse import parse_assistant_choice, parse_tool_call, parse_tool_calls, parse_usage
+from anvil.llm.types import LLMResponse, Message, Usage
 from anvil.tools.base import ToolSpec
 
 DeltaCallback = Callable[[str, str], None]
 
 
 class LLMError(RuntimeError):
+    pass
+
+
+class LLMCancelled(LLMError):
     pass
 
 
@@ -36,9 +42,21 @@ class DeepSeekClient:
             },
             timeout=httpx.Timeout(config.request_timeout, connect=30.0),
         )
+        self._stream = None
 
     def close(self) -> None:
+        self.abort()
         self._http.close()
+
+    def abort(self) -> None:
+        stream = self._stream
+        self._stream = None
+        if stream is None:
+            return
+        try:
+            stream.close()
+        except Exception:
+            pass
 
     def complete(
         self,
@@ -47,14 +65,27 @@ class DeepSeekClient:
         *,
         on_delta: DeltaCallback | None = None,
         stream: bool = True,
+        thinking: bool | None = None,
+        reasoning_effort: str | None = None,
+        cancel: Event | None = None,
     ) -> LLMResponse:
-        body = self._payload(messages, tools, stream=stream)
+        body = self._payload(
+            messages,
+            tools,
+            stream=stream,
+            thinking=thinking,
+            reasoning_effort=reasoning_effort,
+        )
         last_error: Exception | None = None
         for attempt in range(5):
+            if cancel is not None and cancel.is_set():
+                raise LLMCancelled("cancelled")
             try:
                 if stream:
-                    return self._complete_stream(body, on_delta)
+                    return self._complete_stream(body, on_delta, cancel=cancel)
                 return self._complete_once(body)
+            except LLMCancelled:
+                raise
             except LLMError:
                 raise
             except httpx.HTTPStatusError as exc:
@@ -66,6 +97,8 @@ class DeepSeekClient:
                 detail = _response_detail(exc.response)
                 raise LLMError(f"LLM HTTP {status}: {detail}") from exc
             except (httpx.TimeoutException, httpx.TransportError) as exc:
+                if cancel is not None and cancel.is_set():
+                    raise LLMCancelled("cancelled") from exc
                 if attempt < 4:
                     time.sleep(min(2**attempt, 16))
                     last_error = exc
@@ -79,8 +112,13 @@ class DeepSeekClient:
         tools: list[ToolSpec],
         *,
         stream: bool,
+        thinking: bool | None = None,
+        reasoning_effort: str | None = None,
     ) -> dict[str, Any]:
-        include_reasoning = self.config.thinking
+        use_thinking = self.config.thinking if thinking is None else thinking
+        effort = self.config.reasoning_effort if reasoning_effort is None else reasoning_effort
+        # With tools, DeepSeek requires every prior reasoning_content back.
+        include_reasoning = bool(tools) or use_thinking
         payload: dict[str, Any] = {
             "model": self.config.model,
             "messages": [
@@ -88,10 +126,10 @@ class DeepSeekClient:
             ],
             "max_tokens": self.config.max_tokens,
             "stream": stream,
-            "thinking": {"type": "enabled" if self.config.thinking else "disabled"},
+            "thinking": {"type": "enabled" if use_thinking else "disabled"},
         }
-        if self.config.thinking:
-            payload["reasoning_effort"] = self.config.reasoning_effort
+        if use_thinking:
+            payload["reasoning_effort"] = effort
         if tools:
             payload["tools"] = [tool.openai_schema() for tool in tools]
             payload["tool_choice"] = "auto"
@@ -108,81 +146,93 @@ class DeepSeekClient:
         data = response.json()
         try:
             choice = data["choices"][0]
-            message = choice["message"]
         except (KeyError, IndexError, TypeError) as exc:
             raise LLMError(f"Unexpected LLM payload: {data!r}") from exc
-        return LLMResponse(
-            content=message.get("content"),
-            reasoning_content=message.get("reasoning_content"),
-            tool_calls=_parse_tool_calls(message.get("tool_calls")),
-            usage=_parse_usage(data.get("usage")),
-            finish_reason=choice.get("finish_reason"),
-        )
+        if not isinstance(choice, dict) or "message" not in choice:
+            raise LLMError(f"Unexpected LLM payload: {data!r}")
+        return parse_assistant_choice(choice, data.get("usage"))
 
     def _complete_stream(
         self,
         body: dict[str, Any],
         on_delta: DeltaCallback | None,
+        cancel: Event | None = None,
+    ) -> LLMResponse:
+        with self._http.stream("POST", "/chat/completions", json=body) as response:
+            self._stream = response
+            try:
+                return self._read_stream(response, on_delta, cancel)
+            finally:
+                if self._stream is response:
+                    self._stream = None
+
+    def _read_stream(
+        self,
+        response: httpx.Response,
+        on_delta: DeltaCallback | None,
+        cancel: Event | None,
     ) -> LLMResponse:
         content_parts: list[str] = []
         reasoning_parts: list[str] = []
         call_slots: dict[int, dict[str, str]] = {}
         usage = Usage()
         finish_reason: str | None = None
-
-        with self._http.stream("POST", "/chat/completions", json=body) as response:
-            if response.status_code >= 400:
-                response.read()
-                raise httpx.HTTPStatusError(
-                    "error", request=response.request, response=response
+        if response.status_code >= 400:
+            response.read()
+            raise httpx.HTTPStatusError(
+                "error", request=response.request, response=response
+            )
+        for line in response.iter_lines():
+            if cancel is not None and cancel.is_set():
+                raise LLMCancelled("cancelled")
+            if not line:
+                continue
+            if line.startswith(":"):
+                continue
+            if not line.startswith("data:"):
+                continue
+            data = line[5:].strip()
+            if data == "[DONE]":
+                break
+            try:
+                chunk = json.loads(data)
+            except json.JSONDecodeError:
+                continue
+            if chunk.get("usage"):
+                usage = parse_usage(chunk["usage"])
+            choices = chunk.get("choices") or []
+            if not choices:
+                continue
+            choice = choices[0]
+            finish_reason = choice.get("finish_reason") or finish_reason
+            delta = choice.get("delta") or {}
+            reasoning = delta.get("reasoning_content")
+            if reasoning is None:
+                reasoning = delta.get("reasoning")
+            if reasoning:
+                reasoning_parts.append(reasoning)
+                if on_delta:
+                    on_delta("reasoning", reasoning)
+            text = delta.get("content")
+            if text:
+                content_parts.append(text)
+                if on_delta:
+                    on_delta("content", text)
+            for raw_call in delta.get("tool_calls") or []:
+                index = int(raw_call.get("index") or 0)
+                slot = call_slots.setdefault(
+                    index, {"id": "", "name": "", "arguments": ""}
                 )
-            for line in response.iter_lines():
-                if not line:
-                    continue
-                if line.startswith(":"):
-                    continue
-                if not line.startswith("data:"):
-                    continue
-                data = line[5:].strip()
-                if data == "[DONE]":
-                    break
-                try:
-                    chunk = json.loads(data)
-                except json.JSONDecodeError:
-                    continue
-                if chunk.get("usage"):
-                    usage = _parse_usage(chunk["usage"])
-                choices = chunk.get("choices") or []
-                if not choices:
-                    continue
-                choice = choices[0]
-                finish_reason = choice.get("finish_reason") or finish_reason
-                delta = choice.get("delta") or {}
-                reasoning = delta.get("reasoning_content")
-                if reasoning:
-                    reasoning_parts.append(reasoning)
-                    if on_delta:
-                        on_delta("reasoning", reasoning)
-                text = delta.get("content")
-                if text:
-                    content_parts.append(text)
-                    if on_delta:
-                        on_delta("content", text)
-                for raw_call in delta.get("tool_calls") or []:
-                    index = int(raw_call.get("index") or 0)
-                    slot = call_slots.setdefault(
-                        index, {"id": "", "name": "", "arguments": ""}
-                    )
-                    if raw_call.get("id"):
-                        slot["id"] = raw_call["id"]
-                    function = raw_call.get("function") or {}
-                    if function.get("name"):
-                        slot["name"] += function["name"]
-                    if function.get("arguments"):
-                        slot["arguments"] += function["arguments"]
+                if raw_call.get("id"):
+                    slot["id"] = raw_call["id"]
+                function = raw_call.get("function") or {}
+                if function.get("name"):
+                    slot["name"] += function["name"]
+                if function.get("arguments"):
+                    slot["arguments"] += function["arguments"]
 
         tool_calls = [
-            _tool_call_from_parts(
+            parse_tool_call(
                 call_slots[i]["id"] or f"call_{i}",
                 call_slots[i]["name"],
                 call_slots[i]["arguments"],
@@ -199,52 +249,10 @@ class DeepSeekClient:
         )
 
 
-def _parse_tool_calls(raw: Any) -> list[ToolCall]:
-    if not raw:
-        return []
-    parsed: list[ToolCall] = []
-    for item in raw:
-        function = item.get("function") or {}
-        parsed.append(
-            _tool_call_from_parts(
-                item.get("id") or f"call_{len(parsed)}",
-                function.get("name") or "",
-                function.get("arguments") or "",
-            )
-        )
-    return parsed
-
-
-def _tool_call_from_parts(call_id: str, name: str, arguments_raw: str) -> ToolCall:
-    raw = arguments_raw if arguments_raw is not None else "{}"
-    try:
-        loaded = json.loads(raw) if str(raw).strip() else {}
-    except json.JSONDecodeError:
-        return ToolCall(
-            id=call_id,
-            name=name,
-            arguments={},
-            arguments_raw=arguments_raw,
-            parse_error=True,
-        )
-    if not isinstance(loaded, dict):
-        return ToolCall(
-            id=call_id,
-            name=name,
-            arguments={},
-            arguments_raw=arguments_raw,
-            parse_error=True,
-        )
-    return ToolCall(id=call_id, name=name, arguments=loaded, arguments_raw=raw)
-
-
-def _parse_usage(raw: Any) -> Usage:
-    if not isinstance(raw, dict):
-        return Usage()
-    prompt = int(raw.get("prompt_tokens") or 0)
-    completion = int(raw.get("completion_tokens") or 0)
-    total = int(raw.get("total_tokens") or (prompt + completion))
-    return Usage(prompt_tokens=prompt, completion_tokens=completion, total_tokens=total)
+# Kept for tests that imported the private helper.
+_tool_call_from_parts = parse_tool_call
+_parse_tool_calls = parse_tool_calls
+_parse_usage = parse_usage
 
 
 def _response_detail(response: httpx.Response) -> str:

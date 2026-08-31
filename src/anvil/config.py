@@ -4,6 +4,8 @@ import os
 from dataclasses import dataclass
 from pathlib import Path
 
+EFFORT_LEVELS = ("low", "high", "max")
+
 
 def load_dotenv(path: Path) -> None:
     """Load KEY=VALUE pairs without overwriting existing environment variables."""
@@ -70,9 +72,7 @@ class Config:
                 "in the environment or a gitignored .env file."
             )
 
-        effort = (reasoning_effort or os.environ.get("ANVIL_REASONING_EFFORT") or "high").lower()
-        if effort not in {"low", "high", "max"}:
-            raise ConfigError("ANVIL_REASONING_EFFORT must be low, high, or max.")
+        effort = parse_effort(reasoning_effort or os.environ.get("ANVIL_REASONING_EFFORT") or "max")
 
         return cls(
             api_key=api_key,
@@ -81,12 +81,34 @@ class Config:
             thinking=_truthy(os.environ.get("ANVIL_THINKING"), True) if thinking is None else thinking,
             reasoning_effort=effort,
             max_turns=max_turns or int(os.environ.get("ANVIL_MAX_TURNS") or "40"),
-            max_tokens=int(os.environ.get("ANVIL_MAX_TOKENS") or "8192"),
+            max_tokens=int(os.environ.get("ANVIL_MAX_TOKENS") or "256000"),
             context_budget=int(os.environ.get("ANVIL_CONTEXT_BUDGET") or "100000"),
-            request_timeout=float(os.environ.get("ANVIL_REQUEST_TIMEOUT") or "180"),
+            request_timeout=float(os.environ.get("ANVIL_REQUEST_TIMEOUT") or "300"),
             shell_timeout=float(os.environ.get("ANVIL_SHELL_TIMEOUT") or "60"),
             workspace=workspace,
         )
+
+
+def parse_effort(raw: str) -> str:
+    value = (raw or "").strip().lower()
+    if value not in EFFORT_LEVELS:
+        raise ConfigError("reasoning effort must be low, high, or max")
+    return value
+
+
+def effort_label(thinking: bool, effort: str) -> str:
+    return "off" if not thinking else effort
+
+
+def apply_effort_token(thinking: bool, effort: str, token: str) -> tuple[bool, str]:
+    raw = (token or "").strip().lower()
+    if not raw:
+        return thinking, effort
+    if raw in {"off", "none", "disable", "disabled"}:
+        return False, effort
+    if raw in EFFORT_LEVELS:
+        return True, raw
+    raise ValueError("use /effort off | low | high | max")
 
 
 class ConfigError(RuntimeError):

@@ -1,5 +1,12 @@
-from anvil.agent.context import PLACEHOLDER, ContextManager, clip_text, estimate_tokens
-from anvil.llm.types import Message
+from anvil.agent.context import (
+    PLACEHOLDER,
+    ContextManager,
+    clip_text,
+    estimate_tokens,
+    unpaired_assistant_calls,
+    unpaired_tools,
+)
+from anvil.llm.types import Message, ToolCall, Usage
 
 
 def test_clip_text_keeps_head_and_tail() -> None:
@@ -14,7 +21,13 @@ def test_clip_text_keeps_head_and_tail() -> None:
 def test_compact_shrinks_old_tool_results() -> None:
     messages = [Message(role="user", content="fix tests")]
     for i in range(10):
-        messages.append(Message(role="assistant", content=f"step {i}"))
+        messages.append(
+            Message(
+                role="assistant",
+                content=f"step {i}",
+                tool_calls=[ToolCall(id=f"c{i}", name="read_file", arguments={"path": "a.py"})],
+            )
+        )
         messages.append(Message(role="tool", content="x" * 4000, tool_call_id=f"c{i}"))
     manager = ContextManager(budget=2000)
     compacted = manager.prepare(messages)
@@ -24,3 +37,79 @@ def test_compact_shrinks_old_tool_results() -> None:
     assert any(m.role == "tool" and m.content == PLACEHOLDER for m in compacted) or any(
         m.content and "compacted" in m.content for m in compacted
     )
+
+
+def test_prepare_does_not_mutate_original_log() -> None:
+    messages = [Message(role="user", content="fix tests")]
+    for i in range(10):
+        messages.append(
+            Message(
+                role="assistant",
+                content="",
+                tool_calls=[ToolCall(id=f"c{i}", name="read_file", arguments={"path": "a.py"})],
+            )
+        )
+        messages.append(Message(role="tool", content="x" * 4000, tool_call_id=f"c{i}"))
+    snapshot = [m.content for m in messages]
+    ContextManager(budget=2000).prepare(messages)
+    assert [m.content for m in messages] == snapshot
+
+
+def test_compact_keeps_assistant_tool_pairs() -> None:
+    messages = [Message(role="system", content="sys"), Message(role="user", content="go")]
+    for i in range(12):
+        messages.append(
+            Message(
+                role="assistant",
+                content=f"step {i}",
+                tool_calls=[ToolCall(id=f"c{i}", name="read_file", arguments={"path": "a.py"})],
+            )
+        )
+        messages.append(Message(role="tool", content="x" * 4000, tool_call_id=f"c{i}"))
+    view = ContextManager(budget=1500).prepare(messages)
+    assert unpaired_tools(view) == []
+    assert unpaired_assistant_calls(view) == []
+
+
+def test_prepare_synthesizes_missing_tool_results() -> None:
+    messages = [
+        Message(role="user", content="go"),
+        Message(
+            role="assistant",
+            content="",
+            tool_calls=[ToolCall(id="c1", name="read_file", arguments={"path": "a.py"})],
+        ),
+    ]
+    view = ContextManager(budget=20_000).prepare(messages)
+    assert messages[-1].role == "assistant"
+    assert unpaired_assistant_calls(view) == []
+    tool = next(item for item in view if item.role == "tool")
+    assert tool.tool_call_id == "c1"
+    assert "cancelled" in (tool.content or "")
+
+
+def test_prepare_drops_orphan_tool_messages() -> None:
+    messages = [
+        Message(role="user", content="go"),
+        Message(role="tool", content="stray", tool_call_id="ghost"),
+    ]
+    view = ContextManager(budget=20_000).prepare(messages)
+    assert all(item.role != "tool" for item in view)
+    assert [item.role for item in messages] == ["user", "tool"]
+
+
+def test_estimate_is_calibrated_to_usage() -> None:
+    messages = [Message(role="user", content="a" * 90)]
+    manager = ContextManager(budget=100_000)
+    assert manager.estimate(messages) == 30
+    manager.note_prompt_usage(
+        messages, Usage(prompt_tokens=180, completion_tokens=0, total_tokens=180)
+    )
+    assert manager.estimate(messages) == 180
+
+
+def test_zero_usage_keeps_char_estimate() -> None:
+    messages = [Message(role="user", content="a" * 90)]
+    manager = ContextManager(budget=100_000)
+    manager.note_prompt_usage(messages, Usage())
+    assert manager.estimate(messages) == 30

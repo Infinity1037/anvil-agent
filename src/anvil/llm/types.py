@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -18,11 +19,13 @@ class Usage:
     prompt_tokens: int = 0
     completion_tokens: int = 0
     total_tokens: int = 0
+    reasoning_tokens: int = 0
 
     def add(self, other: Usage) -> None:
         self.prompt_tokens += other.prompt_tokens
         self.completion_tokens += other.completion_tokens
         self.total_tokens += other.total_tokens
+        self.reasoning_tokens += other.reasoning_tokens
 
 
 @dataclass
@@ -41,9 +44,14 @@ class Message:
                 "content": self.content or "",
             }
         if self.role == "assistant":
+            # DeepSeek 400s if an assistant turn has neither content nor tool_calls.
+            # `null` counts as unset; send "" when the model only thought or returned empty.
+            content = self.content
+            if content is None and not self.tool_calls:
+                content = ""
             payload: dict[str, Any] = {
                 "role": "assistant",
-                "content": self.content,
+                "content": content,
             }
             if include_reasoning:
                 # DeepSeek returns 400 if tools are present and this field is dropped.
@@ -64,6 +72,36 @@ class Message:
             return payload
         return {"role": self.role, "content": self.content or ""}
 
+    def to_record(self) -> dict[str, Any]:
+        record = {"type": "message"}
+        record.update(self.to_openai(include_reasoning=True))
+        return record
+
+    @classmethod
+    def from_record(cls, payload: dict[str, Any]) -> Message | None:
+        if not isinstance(payload, dict):
+            return None
+        if payload.get("type") == "session":
+            return None
+        role = payload.get("role")
+        if not role:
+            return None
+        if role == "tool":
+            return cls(
+                role="tool",
+                content=payload.get("content") or "",
+                tool_call_id=payload.get("tool_call_id") or "",
+            )
+        from anvil.llm.parse import parse_tool_calls
+
+        calls = parse_tool_calls(payload.get("tool_calls")) or None
+        return cls(
+            role=role,
+            content=payload.get("content"),
+            reasoning_content=payload.get("reasoning_content"),
+            tool_calls=calls,
+        )
+
 
 @dataclass
 class LLMResponse:
@@ -74,15 +112,16 @@ class LLMResponse:
     finish_reason: str | None = None
 
     def as_message(self) -> Message:
+        content = self.content
+        if content is None and not self.tool_calls:
+            content = ""
         return Message(
             role="assistant",
-            content=self.content,
+            content=content,
             reasoning_content=self.reasoning_content,
             tool_calls=self.tool_calls or None,
         )
 
 
 def _dump_args(arguments: dict[str, Any]) -> str:
-    import json
-
     return json.dumps(arguments, ensure_ascii=False)

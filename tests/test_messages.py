@@ -30,6 +30,22 @@ def test_malformed_arguments_set_parse_error() -> None:
     assert call.parse_error is True
 
 
+def test_from_record_preserves_parse_error() -> None:
+    message = Message.from_record(
+        {
+            "role": "assistant",
+            "content": "",
+            "tool_calls": [
+                {"id": "c1", "function": {"name": "list_dir", "arguments": "{"}}
+            ],
+        }
+    )
+    assert message is not None
+    assert message.tool_calls
+    assert message.tool_calls[0].parse_error is True
+    assert message.tool_calls[0].name == "list_dir"
+
+
 def test_missing_reasoning_is_serialized_as_empty_string() -> None:
     message = Message(role="assistant", content="done")
     payload = message.to_openai(include_reasoning=True)

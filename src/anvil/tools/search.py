@@ -5,8 +5,10 @@ import os
 import re
 from pathlib import Path
 
-from anvil.safety import resolve_in_workspace
+from anvil.safety import assert_not_internal, resolve_in_workspace
 from anvil.tools.base import ToolSpec
+from anvil.tools.result import ToolResult
+
 
 def _glob_match(pattern: str, path: Path, root: Path) -> bool:
     pat = pattern.replace("\\", "/")
@@ -51,10 +53,13 @@ def _iter_files(root: Path, glob_pattern: str | None):
 
 
 def make_glob(workspace: Path) -> ToolSpec:
-    def glob_files(pattern: str, path: str = ".") -> str:
+    def glob_files(pattern: str, path: str = ".") -> ToolResult:
+        if not str(pattern).strip():
+            return ToolResult.fail("empty_query", "pattern must not be empty.")
         root = resolve_in_workspace(workspace, path)
+        assert_not_internal(root, workspace)
         if not root.exists():
-            return f"Error: path not found: {path}"
+            return ToolResult.fail("not_found", f"path not found: {path}")
         if root.is_file():
             root = root.parent
         matches: list[str] = []
@@ -66,14 +71,14 @@ def make_glob(workspace: Path) -> ToolSpec:
             if len(matches) >= 200:
                 break
         if not matches:
-            return f"No files matched {pattern!r} under {path}"
+            return ToolResult.success(f"No files matched {pattern!r} under {path}")
         matches.sort()
         extra = "" if len(matches) < 200 else "\n... extra matches omitted"
-        return "\n".join(matches) + extra
+        return ToolResult.success("\n".join(matches) + extra)
 
     return ToolSpec(
         name="glob",
-        description="Find files by glob pattern (for example **/*.py) under a workspace path.",
+        description="Find files by glob pattern (for example **/*.py). Prefer this over find/ls in the shell.",
         parameters={
             "type": "object",
             "properties": {
@@ -99,15 +104,21 @@ def make_grep(workspace: Path) -> ToolSpec:
         path: str = ".",
         glob: str | None = None,
         max_matches: int = 50,
-    ) -> str:
+    ) -> ToolResult:
+        if not str(pattern):
+            return ToolResult.fail("empty_query", "pattern must not be empty.")
         root = resolve_in_workspace(workspace, path)
+        assert_not_internal(root, workspace)
         if not root.exists():
-            return f"Error: path not found: {path}"
+            return ToolResult.fail("not_found", f"path not found: {path}")
         try:
             regex = re.compile(pattern)
         except re.error as exc:
-            return f"Error: invalid regex: {exc}"
-        cap = max(1, min(int(max_matches), 200))
+            return ToolResult.fail("invalid_regex", f"invalid regex: {exc}")
+        try:
+            cap = max(1, min(int(max_matches), 200))
+        except (TypeError, ValueError):
+            return ToolResult.fail("bad_arguments", "max_matches must be an integer.")
         hits: list[str] = []
         files = [root] if root.is_file() else _iter_files(root, glob)
         scanned = 0
@@ -125,14 +136,16 @@ def make_grep(workspace: Path) -> ToolSpec:
                     hits.append(f"{rel}:{line_no}:{line[:240]}")
                     if len(hits) >= cap:
                         joined = "\n".join(hits)
-                        return joined + f"\n... stopped at {cap} matches (scanned {scanned} files)"
+                        return ToolResult.success(
+                            joined + f"\n... stopped at {cap} matches (scanned {scanned} files)"
+                        )
         if not hits:
-            return f"No matches for {pattern!r} under {path}"
-        return "\n".join(hits)
+            return ToolResult.success(f"No matches for {pattern!r} under {path}")
+        return ToolResult.success("\n".join(hits))
 
     return ToolSpec(
         name="grep",
-        description="Search file contents with a Python regular expression. Skips git/venv/node_modules.",
+        description="Search file contents with a Python regular expression. Prefer this over shell grep. Skips git/venv/node_modules.",
         parameters={
             "type": "object",
             "properties": {

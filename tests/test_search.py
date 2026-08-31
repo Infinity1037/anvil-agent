@@ -18,7 +18,7 @@ def test_glob_and_grep(tmp_path: Path) -> None:
 
     found = registry.execute(
         ToolCall(id="1", name="glob", arguments={"pattern": "*.py"}, arguments_raw="")
-    )
+    ).content
     assert "src/util.py" in found.replace("\\", "/")
     assert ".venv" not in found
 
@@ -29,6 +29,26 @@ def test_glob_and_grep(tmp_path: Path) -> None:
             arguments={"pattern": r"def add", "glob": "*.py"},
             arguments_raw="",
         )
-    )
+    ).content
     assert "src/util.py:1:" in hits.replace("\\", "/")
     assert ".venv" not in hits
+
+
+def test_grep_invalid_regex_has_error_code(tmp_path: Path) -> None:
+    registry = ToolRegistry()
+    registry.register(make_grep(tmp_path))
+    out = registry.execute(
+        ToolCall(id="1", name="grep", arguments={"pattern": "["}, arguments_raw="")
+    )
+    assert out.ok is False
+    assert out.error_code == "invalid_regex"
+
+
+def test_glob_empty_pattern_has_error_code(tmp_path: Path) -> None:
+    registry = ToolRegistry()
+    registry.register(make_glob(tmp_path))
+    out = registry.execute(
+        ToolCall(id="1", name="glob", arguments={"pattern": "  "}, arguments_raw="")
+    )
+    assert out.ok is False
+    assert out.error_code == "empty_query"
