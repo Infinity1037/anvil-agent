@@ -494,12 +494,17 @@ class AnvilApp(App[None]):
         if callable(getter):
             return getter()
         messages = getattr(self.agent, "messages", [])
-        budget = int(getattr(self.agent.config, "context_budget", 100_000))
+        budget = int(getattr(self.agent.config, "context_budget", 160_000))
+        context_window = int(getattr(self.agent.config, "context_window", 200_000))
+        output_limit = int(getattr(self.agent.config, "max_tokens", 32_000))
         return ContextSnapshot(
             estimated_tokens=0,
             budget=budget,
             history_messages=len(messages),
             view_messages=len(messages),
+            context_window=context_window,
+            output_limit=output_limit,
+            compaction_threshold=min(budget, int(context_window * 0.85)),
         )
 
     def _start_manual_compaction(self, instruction: str) -> None:

@@ -37,7 +37,7 @@ def context_badge(snapshot: "ContextSnapshot", *, detailed: bool = True) -> str:
     if detailed:
         label += (
             f" ({short_tokens(snapshot.estimated_tokens)}/"
-            f"{short_tokens(snapshot.budget)})"
+            f"{short_tokens(snapshot.display_limit)})"
         )
     return label
 
@@ -50,9 +50,26 @@ def context_report(snapshot: "ContextSnapshot", usage: "Usage") -> str:
         else "checkpoint not active"
     )
     estimate = "calibrated by recent API usage" if snapshot.calibrated else "character estimate"
+    limits = ""
+    if snapshot.display_limit != snapshot.budget:
+        limits = (
+            f"context window {short_tokens(snapshot.display_limit)} tokens; "
+            f"remaining ≈{short_tokens(snapshot.remaining_tokens)}\n"
+            f"agent view budget {short_tokens(snapshot.budget)} tokens; "
+            f"remaining ≈{short_tokens(snapshot.budget_remaining_tokens)}\n"
+        )
+        if snapshot.output_limit:
+            limits += f"per-turn output cap {short_tokens(snapshot.output_limit)} tokens\n"
+        if snapshot.compaction_threshold:
+            limits += (
+                "auto compact near "
+                f"{short_tokens(snapshot.compaction_threshold)} tokens\n"
+            )
+    else:
+        limits = f"remaining ≈{short_tokens(snapshot.remaining_tokens)} tokens\n"
     return (
         f"context {context_badge(snapshot).removeprefix('ctx ')}\n"
-        f"remaining ≈{short_tokens(snapshot.remaining_tokens)} tokens\n"
+        f"{limits}"
         f"messages {snapshot.history_messages} full / {snapshot.view_messages} active\n"
         f"skills {snapshot.active_skills} active\n"
         f"{checkpoint}\n"

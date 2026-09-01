@@ -32,6 +32,17 @@ def _truthy(value: str | None, default: bool) -> bool:
     return value.strip().lower() not in {"0", "false", "no", "off", "disabled"}
 
 
+def _positive_int_env(name: str, default: int) -> int:
+    raw = os.environ.get(name)
+    try:
+        value = int(raw) if raw not in {None, ""} else default
+    except ValueError as exc:
+        raise ConfigError(f"{name} must be a positive integer") from exc
+    if value <= 0:
+        raise ConfigError(f"{name} must be a positive integer")
+    return value
+
+
 @dataclass(frozen=True)
 class Config:
     api_key: str
@@ -45,6 +56,7 @@ class Config:
     request_timeout: float
     shell_timeout: float
     workspace: Path
+    context_window: int = 200_000
 
     @classmethod
     def from_env(
@@ -74,6 +86,15 @@ class Config:
 
         effort = parse_effort(reasoning_effort or os.environ.get("ANVIL_REASONING_EFFORT") or "max")
 
+        max_tokens_value = _positive_int_env("ANVIL_MAX_TOKENS", 32_000)
+        context_window_value = _positive_int_env("ANVIL_CONTEXT_WINDOW", 200_000)
+        context_budget_value = _positive_int_env("ANVIL_CONTEXT_BUDGET", 160_000)
+        if context_budget_value + max_tokens_value > context_window_value:
+            raise ConfigError(
+                "ANVIL_CONTEXT_BUDGET + ANVIL_MAX_TOKENS must not exceed "
+                "ANVIL_CONTEXT_WINDOW"
+            )
+
         return cls(
             api_key=api_key,
             base_url=(os.environ.get("ANVIL_BASE_URL") or "https://api.deepseek.com").rstrip("/"),
@@ -81,11 +102,12 @@ class Config:
             thinking=_truthy(os.environ.get("ANVIL_THINKING"), True) if thinking is None else thinking,
             reasoning_effort=effort,
             max_turns=max_turns or int(os.environ.get("ANVIL_MAX_TURNS") or "40"),
-            max_tokens=int(os.environ.get("ANVIL_MAX_TOKENS") or "256000"),
-            context_budget=int(os.environ.get("ANVIL_CONTEXT_BUDGET") or "100000"),
+            max_tokens=max_tokens_value,
+            context_budget=context_budget_value,
             request_timeout=float(os.environ.get("ANVIL_REQUEST_TIMEOUT") or "300"),
             shell_timeout=float(os.environ.get("ANVIL_SHELL_TIMEOUT") or "60"),
             workspace=workspace,
+            context_window=context_window_value,
         )
 
 

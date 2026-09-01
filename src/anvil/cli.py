@@ -134,7 +134,12 @@ def main(argv: list[str] | None = None) -> int:
         config,
         client,
         tools,
-        ContextManager(config.context_budget, workspace=workspace),
+        ContextManager(
+            config.context_budget,
+            workspace=workspace,
+            context_window=config.context_window,
+            output_limit=config.max_tokens,
+        ),
         session=session,
     )
 

@@ -78,10 +78,13 @@ cp .env.example .env
 | `ANVIL_MODEL` | `deepseek-v4-flash` | 模型 id，可改为 `deepseek-v4-pro` |
 | `ANVIL_THINKING` | `1` | 是否开启思考模式 |
 | `ANVIL_REASONING_EFFORT` | `max` | `low` / `high` / `max`；复杂 Agent 默认最强思考 |
-| `ANVIL_MAX_TOKENS` | `256000` | 单次请求输出上限（含思考链） |
+| `ANVIL_MAX_TOKENS` | `32000` | 单次请求输出上限（含思考链） |
+| `ANVIL_CONTEXT_WINDOW` | `200000` | Agent 有效上下文窗口；底栏与 `/context` 以此显示用量 |
 | `ANVIL_REQUEST_TIMEOUT` | `300` | 流式空闲超时（秒） |
 | `ANVIL_MAX_TURNS` | `40` | 最大循环轮次 |
-| `ANVIL_CONTEXT_BUDGET` | `100000` | 触发压缩的估算 token 预算 |
+| `ANVIL_CONTEXT_BUDGET` | `160000` | Agent 安全模型视图上限；为输出和协议开销预留空间 |
+
+上下文窗口、Agent 视图预算和单轮输出是三个独立概念。配置必须满足 `ANVIL_CONTEXT_BUDGET + ANVIL_MAX_TOKENS <= ANVIL_CONTEXT_WINDOW`；底栏按有效窗口显示占用，`/context` 会同时列出三者和自动压缩边界。默认在有效窗口的 85% 与安全视图上限两者中较早的位置生成语义 checkpoint。
 
 命令行：`anvil --workspace .` 进入全屏对话；后面可以跟一句首条任务。`--once` 表示只跑这一次。`--plain` 关闭全屏 TUI。`--effort low|high|max` 覆盖启动时的思考强度。`--continue` 恢复本工作区最近一次会话。`/status` `/context` `/compact` `/skills` `/skill:<名称>` `/effort` `/clear` `/resume` `/exit` 是会话内命令。
 

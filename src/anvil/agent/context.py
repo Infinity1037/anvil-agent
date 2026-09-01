@@ -66,15 +66,26 @@ class ContextSnapshot:
     covered_count: int = 0
     calibrated: bool = False
     active_skills: int = 0
+    context_window: int | None = None
+    output_limit: int = 0
+    compaction_threshold: int = 0
+
+    @property
+    def display_limit(self) -> int:
+        return self.context_window or self.budget
 
     @property
     def usage_ratio(self) -> float:
-        if self.budget <= 0:
+        if self.display_limit <= 0:
             return 0.0
-        return self.estimated_tokens / self.budget
+        return self.estimated_tokens / self.display_limit
 
     @property
     def remaining_tokens(self) -> int:
+        return max(0, self.display_limit - self.estimated_tokens)
+
+    @property
+    def budget_remaining_tokens(self) -> int:
         return max(0, self.budget - self.estimated_tokens)
 
 
@@ -197,9 +208,18 @@ def pair_messages(messages: list[Message]) -> list[Message]:
 class ContextManager:
     """Cheap-first context control. prepare() never mutates the input list."""
 
-    def __init__(self, budget: int, workspace: Path | None = None) -> None:
+    def __init__(
+        self,
+        budget: int,
+        workspace: Path | None = None,
+        *,
+        context_window: int | None = None,
+        output_limit: int = 0,
+    ) -> None:
         self.budget = budget
         self.workspace = workspace
+        self.context_window = context_window or budget
+        self.output_limit = output_limit
         self._token_ratio: float | None = None
         self._summary: str | None = None
         self._covered_count: int | None = None
@@ -248,6 +268,9 @@ class ContextManager:
             covered_count=self._covered_count or 0,
             calibrated=self._token_ratio is not None,
             active_skills=len(self._skill_pins),
+            context_window=self.context_window,
+            output_limit=self.output_limit,
+            compaction_threshold=self.compaction_threshold,
         )
 
     def ingest_tool_result(self, text: str, *, call_id: str = "") -> str:
@@ -294,7 +317,12 @@ class ContextManager:
         return pair_messages(view)
 
     def should_compact(self, view: list[Message]) -> bool:
-        return self.estimate(view) > int(self.budget * 0.8)
+        return self.estimate(view) >= self.compaction_threshold
+
+    @property
+    def compaction_threshold(self) -> int:
+        """Semantic checkpoint boundary, capped by the safe active-view budget."""
+        return min(self.budget, int(self.context_window * 0.85))
 
     def fits(self, view: list[Message]) -> bool:
         return self.estimate(view) <= self.budget

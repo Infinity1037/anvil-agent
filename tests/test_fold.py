@@ -39,6 +39,26 @@ def test_context_display_derives_live_ratio_from_token_counts() -> None:
     assert short_tokens(1_250_000) == "1.2m"
 
 
+def test_context_display_separates_context_window_from_agent_budget() -> None:
+    snapshot = ContextSnapshot(
+        estimated_tokens=42_000,
+        budget=160_000,
+        history_messages=30,
+        view_messages=12,
+        calibrated=True,
+        context_window=200_000,
+        output_limit=32_000,
+        compaction_threshold=160_000,
+    )
+    assert context_badge(snapshot) == "ctx ≈21% (42k/200k)"
+    report = context_report(snapshot, Usage())
+    assert "context window 200k tokens" in report
+    assert "agent view budget 160k tokens" in report
+    assert "per-turn output cap 32k tokens" in report
+    assert "auto compact near 160k tokens" in report
+    assert "remaining ≈118k" in report
+
+
 def test_compaction_result_text_is_observable_without_exposing_summary() -> None:
     text = compact_result_text(CompactResult("compacted", 62_100, 13_400, 34))
     assert "≈62.1k → 13.4k" in text

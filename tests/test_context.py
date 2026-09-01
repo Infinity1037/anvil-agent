@@ -204,6 +204,37 @@ def test_active_skill_is_reattached_after_checkpoint_cut() -> None:
     assert manager.snapshot(messages).active_skills == 1
 
 
+def test_snapshot_keeps_context_window_separate_from_working_budget() -> None:
+    manager = ContextManager(
+        budget=160_000,
+        context_window=200_000,
+        output_limit=32_000,
+    )
+
+    snapshot = manager.snapshot([Message(role="system", content="system")])
+
+    assert snapshot.budget == 160_000
+    assert snapshot.context_window == 200_000
+    assert snapshot.display_limit == 200_000
+    assert snapshot.output_limit == 32_000
+    assert snapshot.compaction_threshold == 160_000
+    assert snapshot.budget_remaining_tokens < snapshot.remaining_tokens
+
+
+def test_semantic_compaction_uses_window_ratio_capped_by_safe_budget() -> None:
+    manager = ContextManager(budget=160_000, context_window=200_000)
+    below = [Message(role="user", content="x" * 479_997)]
+    boundary = [Message(role="user", content="x" * 480_000)]
+
+    assert manager.estimate(below) == 159_999
+    assert not manager.should_compact(below)
+    assert manager.estimate(boundary) == 160_000
+    assert manager.should_compact(boundary)
+
+    ratio_limited = ContextManager(budget=190_000, context_window=200_000)
+    assert ratio_limited.compaction_threshold == 170_000
+
+
 def test_active_skill_survives_cheap_tool_result_folding() -> None:
     messages = [Message(role="system", content="system")]
     for index in range(8):

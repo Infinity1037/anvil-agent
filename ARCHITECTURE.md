@@ -58,7 +58,7 @@ loop:
 
 ## DeepSeek
 
-默认 `deepseek-v4-flash`，思考模式开启，`reasoning_effort=max`，`max_tokens=256000`。带 `tools` 时每一轮 assistant 必须回传 `reasoning_content`，否则 HTTP 400。会话内 `/effort` 只改下一轮请求，不改历史。400/401 不重试；429/5xx 有限退避。
+默认 `deepseek-v4-flash`，思考模式开启，`reasoning_effort=max`。Anvil 为日常 Coding Agent 工作流采用 200,000-token 有效窗口、160,000-token 安全模型视图和 32,000-token 单轮输出上限，为工具 schema 与估算误差保留余量；底栏按有效窗口显示占用，`/context` 分列各层限制。语义 checkpoint 在有效窗口的 85% 与安全视图上限中较早的位置触发，默认约 160,000 tokens；更早先折叠旧工具结果。带 `tools` 时每一轮 assistant 必须回传 `reasoning_content`，否则 HTTP 400。会话内 `/effort` 只改下一轮请求，不改历史。400/401 不重试；429/5xx 有限退避。
 
 ## 上下文 checkpoint
 
