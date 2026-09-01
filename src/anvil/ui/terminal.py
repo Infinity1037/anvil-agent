@@ -56,6 +56,8 @@ class TerminalUI:
         elif kind == "compact":
             if self.verbose:
                 self.console.print("[dim]compacted context[/dim]")
+        elif kind == "skill":
+            self.console.print(f"[dim]activated project skill {payload.get('name')}[/dim]")
         elif kind == "delta":
             text = payload.get("text") or ""
             if payload.get("kind") == "reasoning":

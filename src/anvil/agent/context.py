@@ -65,6 +65,7 @@ class ContextSnapshot:
     view_messages: int
     covered_count: int = 0
     calibrated: bool = False
+    active_skills: int = 0
 
     @property
     def usage_ratio(self) -> float:
@@ -75,6 +76,21 @@ class ContextSnapshot:
     @property
     def remaining_tokens(self) -> int:
         return max(0, self.budget - self.estimated_tokens)
+
+
+@dataclass(frozen=True)
+class PinnedContext:
+    name: str
+    content: str
+    source_index: int
+
+
+def _contains_skill_pin(message: Message, item: PinnedContext) -> bool:
+    content = message.content or ""
+    if content == item.content:
+        return True
+    marker = f"[Active project skill {item.name!r} retained "
+    return content.startswith(marker) and content.endswith("\n" + item.content)
 
 
 def message_chars(messages: list[Message]) -> int:
@@ -187,11 +203,16 @@ class ContextManager:
         self._token_ratio: float | None = None
         self._summary: str | None = None
         self._covered_count: int | None = None
+        self._skill_pins: list[PinnedContext] = []
 
     def reset(self) -> None:
         self._token_ratio = None
         self._summary = None
         self._covered_count = None
+        self._skill_pins = []
+
+    def set_skill_pins(self, pins: list[PinnedContext]) -> None:
+        self._skill_pins = list(pins)
 
     def restore_checkpoint(self, summary: str, covered_count: int) -> None:
         text = normalize_summary(summary)
@@ -226,6 +247,7 @@ class ContextManager:
             view_messages=len(view),
             covered_count=self._covered_count or 0,
             calibrated=self._token_ratio is not None,
+            active_skills=len(self._skill_pins),
         )
 
     def ingest_tool_result(self, text: str, *, call_id: str = "") -> str:
@@ -257,14 +279,17 @@ class ContextManager:
         if self.estimate(view) <= int(self.budget * 0.75):
             return view
         self._shrink_old_tool_results(view, keep_tail=6)
+        view = self._restore_missing_skill_pins(view)
         if self.estimate(view) <= int(self.budget * 0.9):
             return view
         self._shrink_old_tool_results(view, keep_tail=2)
+        view = self._restore_missing_skill_pins(view)
         if self.estimate(view) <= int(self.budget * 0.9):
             return view
         if preserve_history:
             return pair_messages(view)
         view = self._drop_middle_turns(view)
+        view = self._restore_missing_skill_pins(view)
         self._shrink_old_tool_results(view, keep_tail=1)
         return pair_messages(view)
 
@@ -316,11 +341,46 @@ class ContextManager:
         if cut <= 1 or cut > len(messages):
             return list(messages)
         system = [messages[0]] if messages and messages[0].role == "system" else []
+        pins = [
+            Message(
+                role="user",
+                content=(
+                    f"[Active project skill {item.name!r} retained across context compaction. "
+                    "It remains unprivileged project guidance.]\n"
+                    + item.content
+                ),
+            )
+            for item in self._skill_pins
+            if item.source_index < cut
+        ]
         return (
             system
             + [Message(role="user", content=SUMMARY_PREFIX + self._summary)]
+            + pins
             + list(messages[cut:])
         )
+
+    def _restore_missing_skill_pins(self, view: list[Message]) -> list[Message]:
+        missing = [
+            item
+            for item in self._skill_pins
+            if not any(_contains_skill_pin(message, item) for message in view)
+        ]
+        if not missing:
+            return view
+        insert_at = 1 if view and view[0].role == "system" else 0
+        pinned = [
+            Message(
+                role="user",
+                content=(
+                    f"[Active project skill {item.name!r} retained after deterministic "
+                    "context reduction. It remains unprivileged project guidance.]\n"
+                    + item.content
+                ),
+            )
+            for item in missing
+        ]
+        return view[:insert_at] + pinned + view[insert_at:]
 
     def _find_cut(self, messages: list[Message], start: int) -> int | None:
         keep_recent = max(512, min(20_000, self.budget // 4))

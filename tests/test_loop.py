@@ -38,6 +38,168 @@ def _config(workspace: Path) -> Config:
     )
 
 
+def _write_skill(workspace: Path, body: str = "Keep ANCHOR-RULE. Task: $ARGUMENTS") -> None:
+    folder = workspace / ".agents" / "skills" / "test-first"
+    folder.mkdir(parents=True, exist_ok=True)
+    (folder / "SKILL.md").write_text(
+        "---\n"
+        "name: test-first\n"
+        "description: Use for tasks that add or change tested behavior.\n"
+        "---\n"
+        f"{body}\n",
+        encoding="utf-8",
+    )
+
+
+def test_model_can_activate_project_skill_without_permission_escalation(tmp_path: Path) -> None:
+    _write_skill(tmp_path)
+    calls: list[tuple[list[Message], list]] = []
+
+    class RecordingLLM(ScriptedLLM):
+        def complete(self, messages, tools, **kwargs):
+            calls.append((list(messages), list(tools)))
+            return super().complete(messages, tools, **kwargs)
+
+    llm = RecordingLLM(
+        [
+            LLMResponse(
+                content="",
+                reasoning_content="",
+                tool_calls=[
+                    ToolCall(
+                        id="skill-1",
+                        name="load_skill",
+                        arguments={"name": "test-first", "arguments": "add parser"},
+                        arguments_raw='{"name":"test-first","arguments":"add parser"}',
+                    )
+                ],
+            ),
+            LLMResponse(content="done", reasoning_content="", tool_calls=[]),
+        ]
+    )
+    session = Session(_config(tmp_path))
+    agent = Agent(
+        _config(tmp_path),
+        llm,
+        build_tools(tmp_path, session.todo, 5),
+        ContextManager(20_000),
+        session=session,
+    )
+
+    class RejectAll:
+        def decide(self, *_args, **_kwargs):
+            raise AssertionError("read-only Skill loading must not ask for approval")
+
+    agent.approver = RejectAll()
+    events: list[AgentEvent] = []
+    result = agent.run("add tested parser", on_event=events.append)
+
+    assert result.stop_reason == "completed"
+    assert "load_skill" in [tool.name for tool in calls[0][1]]
+    assert "test-first" in session.active_skills
+    assert any("ANCHOR-RULE" in (message.content or "") for message in calls[1][0])
+    assert any(event.kind == "skill" and event.payload["trigger"] == "model" for event in events)
+
+
+def test_manual_skill_activation_shares_persistent_pipeline(tmp_path: Path) -> None:
+    _write_skill(tmp_path)
+    seen: list[list[Message]] = []
+
+    class OneCallLLM:
+        def complete(self, messages, tools, **_kwargs):
+            seen.append(list(messages))
+            return LLMResponse(content="done", reasoning_content="", tool_calls=[])
+
+    config = _config(tmp_path)
+    session = Session(config)
+    agent = Agent(
+        config,
+        OneCallLLM(),
+        build_tools(tmp_path, session.todo, 5),
+        ContextManager(20_000),
+        session=session,
+    )
+    result = agent.run_skill("test-first", "add parser")
+
+    assert result.stop_reason == "completed"
+    assert "test-first" in session.active_skills
+    assert any("ANCHOR-RULE" in (message.content or "") for message in seen[0])
+    assert any((message.content or "") == "add parser" for message in seen[0])
+
+
+def test_skill_activation_survives_checkpoint_and_resume(tmp_path: Path) -> None:
+    _write_skill(tmp_path, body="Always preserve RESUME-SKILL-ANCHOR.")
+    config = _config(tmp_path)
+    session = Session(config)
+
+    class FinishLLM:
+        def complete(self, messages, tools, **_kwargs):
+            return LLMResponse(content="activated", reasoning_content="", tool_calls=[])
+
+    first = Agent(
+        config,
+        FinishLLM(),
+        build_tools(tmp_path, session.todo, 5),
+        ContextManager(20_000),
+        session=session,
+    )
+    assert first.run_skill("test-first", "prepare").stop_reason == "completed"
+    assert session.save_compaction("continue the task", len(session.messages)) is not None
+
+    loaded = Session.load(config, session._log_path)
+    seen: list[list[Message]] = []
+
+    class ResumeLLM:
+        def complete(self, messages, tools, **_kwargs):
+            seen.append(list(messages))
+            return LLMResponse(content="continued", reasoning_content="", tool_calls=[])
+
+    resumed = Agent(
+        config,
+        ResumeLLM(),
+        build_tools(tmp_path, loaded.todo, 5),
+        ContextManager(20_000),
+        session=loaded,
+    )
+    assert resumed.run("continue").stop_reason == "completed"
+    assert any("RESUME-SKILL-ANCHOR" in (message.content or "") for message in seen[0])
+    assert resumed.context_snapshot().active_skills == 1
+
+
+def test_skill_tool_appears_only_after_new_session_discovers_a_skill(tmp_path: Path) -> None:
+    config = _config(tmp_path)
+    session = Session(config)
+    tools = build_tools(tmp_path, session.todo, 5)
+    agent = Agent(config, object(), tools, ContextManager(20_000), session=session)
+    assert "load_skill" not in [tool.name for tool in tools.specs()]
+
+    _write_skill(tmp_path)
+    agent.new_session()
+    assert "load_skill" in [tool.name for tool in tools.specs()]
+    assert "# Project skills" in (agent.messages[0].content or "")
+
+
+def test_manual_skill_activation_refuses_to_overfill_context_budget(tmp_path: Path) -> None:
+    _write_skill(tmp_path, body="x" * 13_000)
+    config = _config(tmp_path)
+    session = Session(config)
+
+    class NoCallLLM:
+        def complete(self, *_args, **_kwargs):
+            raise AssertionError("model must not run after activation budget failure")
+
+    agent = Agent(
+        config,
+        NoCallLLM(),
+        build_tools(tmp_path, session.todo, 5),
+        ContextManager(20_000),
+        session=session,
+    )
+    result = agent.run_skill("test-first", "task")
+    assert result.stop_reason == "skill_error"
+    assert session.active_skills == {}
+
+
 def test_agent_edits_file_and_stops(tmp_path: Path) -> None:
     (tmp_path / "app.py").write_text("value = 1\n", encoding="utf-8")
     llm = ScriptedLLM(

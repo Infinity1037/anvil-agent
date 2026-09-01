@@ -15,6 +15,17 @@ from anvil.tui.complete import (
 )
 
 
+def test_skill_slash_completion_uses_discovered_metadata() -> None:
+    items = match_slash(
+        "/skill:rev",
+        (("review-code", "Review source changes"), ("test-first", "Run tests")),
+    )
+    assert items is not None
+    assert [(item.value, item.detail) for item in items] == [
+        ("skill:review-code", "Review source changes")
+    ]
+
+
 def test_shift_enter_key_is_detected_without_windows_api() -> None:
     assert is_shift_enter(Key("shift+enter", None)) is True
     assert is_shift_enter(Key("enter", "\r")) is False

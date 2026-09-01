@@ -190,3 +190,46 @@ def test_tampered_history_invalidates_compaction_checkpoint(tmp_path: Path) -> N
     path.write_text(text, encoding="utf-8")
     loaded = Session.load(_config(tmp_path), path)
     assert loaded.compaction is None
+
+
+def test_skill_activation_persists_and_validates_source(tmp_path: Path) -> None:
+    session = Session(_config(tmp_path))
+    source = Message(role="user", content="[Project skill activated]\nANCHOR-RULE")
+    assert session.append_skill_source(source, "test-first", source.content or "")
+
+    loaded = Session.load(_config(tmp_path), session._log_path)
+    assert loaded.active_skills["test-first"].content.endswith("ANCHOR-RULE")
+
+    text = session._log_path.read_text(encoding="utf-8")
+    session._log_path.write_text(text.replace("ANCHOR-RULE", "TAMPERED", 1), encoding="utf-8")
+    tampered = Session.load(_config(tmp_path), session._log_path)
+    assert tampered.active_skills == {}
+
+
+def test_skill_activation_rejects_content_that_differs_from_source(tmp_path: Path) -> None:
+    session = Session(_config(tmp_path))
+    source = Message(role="user", content="[Project skill activated]\nORIGINAL")
+    assert session.append_skill_source(source, "test-first", source.content or "")
+    rows = [json.loads(line) for line in session._log_path.read_text(encoding="utf-8").splitlines()]
+    activation = next(row for row in rows if row.get("type") == "skill_activation")
+    activation["content"] = "[Project skill activated]\nINJECTED"
+    session._log_path.write_text(
+        "\n".join(json.dumps(row, ensure_ascii=False) for row in rows) + "\n",
+        encoding="utf-8",
+    )
+
+    loaded = Session.load(_config(tmp_path), session._log_path)
+    assert loaded.active_skills == {}
+
+
+def test_failed_skill_activation_write_does_not_publish_memory_state(
+    tmp_path: Path, monkeypatch
+) -> None:
+    session = Session(_config(tmp_path))
+    before = list(session.messages)
+    monkeypatch.setattr(session, "_append_json_rows", lambda _rows: False)
+    source = Message(role="user", content="skill body")
+
+    assert not session.append_skill_source(source, "test-first", "skill body")
+    assert session.messages == before
+    assert session.active_skills == {}

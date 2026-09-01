@@ -13,7 +13,7 @@ from anvil.config import Config, ConfigError
 from anvil.llm.openai_compat import DeepSeekClient
 from anvil.session import Session, find_session, latest_session
 from anvil.tools import build_tools
-from anvil.ui.format import compact_result_text, context_badge, context_report
+from anvil.ui.format import compact_result_text, context_badge, context_report, skills_report
 from anvil.ui.prompt import read_user_line
 from anvil.ui.terminal import TerminalUI
 
@@ -191,6 +191,29 @@ def _run_once(agent: Agent, ui: TerminalUI, prompt: str) -> int:
     return 0 if result.stop_reason == "completed" else 1
 
 
+def _run_skill_once(agent: Agent, ui: TerminalUI, name: str, task: str) -> int:
+    ui.begin_turn()
+    agent.session.cancel.clear()
+    try:
+        result = agent.run_skill(
+            name,
+            task,
+            on_event=as_ui_handler(ui.handle),
+            cancel=agent.session.cancel,
+        )
+    except KeyboardInterrupt:
+        agent.session.cancel.set()
+        ui.console.print("\n[dim]Interrupted[/dim]")
+        return 0
+    ui.result(
+        result.stop_reason,
+        result.turns,
+        result.usage.prompt_tokens,
+        result.usage.completion_tokens,
+    )
+    return 0 if result.stop_reason == "completed" else 1
+
+
 def _repl(agent: Agent, ui: TerminalUI) -> int:
     ui.console.print("[dim]Enter send · Ctrl+O expand · Ctrl+C interrupt · /help[/dim]")
     while True:
@@ -210,6 +233,8 @@ def _repl(agent: Agent, ui: TerminalUI) -> int:
                 "/status       model, session, tokens\n"
                 "/context      current model-view budget and checkpoint\n"
                 "/compact      compact old context; optional focus text\n"
+                "/skills       list project Skills\n"
+                "/skill:<name> activate a Skill; optional task text\n"
                 "/effort       thinking intensity: off | low | high | max\n"
                 "/clear        start a new session in this workspace\n"
                 "/resume       list or restore a previous session\n"
@@ -268,6 +293,24 @@ def _repl(agent: Agent, ui: TerminalUI) -> int:
             continue
         if line == "/context":
             ui.console.print(context_report(agent.context_snapshot(), agent.usage))
+            continue
+        if line == "/skills":
+            store = agent.session.skills
+            ui.console.print(
+                skills_report(
+                    agent.skill_infos(),
+                    set(agent.session.active_skills),
+                    store.issues,
+                )
+            )
+            continue
+        if line.startswith("/skill:"):
+            command, _, task = line.partition(" ")
+            name = command[len("/skill:") :].strip()
+            if not name:
+                ui.console.print("[red]use /skill:<name> [task][/red]")
+                continue
+            _run_skill_once(agent, ui, name, task.strip())
             continue
         if line == "/compact" or line.startswith("/compact "):
             instruction = line[len("/compact") :].strip()

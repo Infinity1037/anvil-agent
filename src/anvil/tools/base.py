@@ -26,6 +26,7 @@ class ToolSpec:
     parameters: dict[str, Any]
     handler: Handler
     parallel_safe: bool = False
+    available: Callable[[], bool] | None = None
 
     @property
     def required(self) -> list[str]:
@@ -58,7 +59,11 @@ class ToolRegistry:
         self._tools[tool.name] = tool
 
     def specs(self) -> list[ToolSpec]:
-        return list(self._tools.values())
+        return [
+            tool
+            for tool in self._tools.values()
+            if tool.available is None or tool.available()
+        ]
 
     def execute(self, call: ToolCall) -> ToolResult:
         try:
@@ -68,8 +73,8 @@ class ToolRegistry:
 
     def _execute(self, call: ToolCall) -> ToolResult:
         tool = self._tools.get(call.name)
-        if tool is None:
-            available = ", ".join(sorted(self._tools)) or "(none)"
+        if tool is None or (tool.available is not None and not tool.available()):
+            available = ", ".join(sorted(item.name for item in self.specs())) or "(none)"
             return ToolResult.fail(
                 "unknown_tool",
                 f"unknown tool '{call.name}'. Available: {available}",

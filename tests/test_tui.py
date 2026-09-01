@@ -51,6 +51,8 @@ class FakeSession:
         self.permission_mode = "ask"
         self.session_allow: set[str] = set()
         self.id = "test-session"
+        self.skills = SimpleNamespace(issues=())
+        self.active_skills: dict[str, object] = {}
 
     def set_effort(self, token: str) -> str:
         self.thinking, self.reasoning_effort = apply_effort_token(
@@ -93,6 +95,8 @@ class FakeAgent:
         self._script = script
         self.compact_calls: list[str] = []
         self.compact_result = CompactResult("nothing_to_compact", 1200, 1200)
+        self._skill_infos: list[object] = []
+        self.skill_runs: list[tuple[str, str]] = []
 
     def reset(self) -> None:
         self.messages.clear()
@@ -109,6 +113,15 @@ class FakeAgent:
                 return
             if on_event:
                 on_event(AgentEvent(kind, payload))
+
+    def skill_infos(self):
+        return tuple(self._skill_infos)
+
+    def run_skill(self, name: str, task: str, on_event=None, cancel=None) -> None:
+        self.skill_runs.append((name, task))
+        if on_event:
+            on_event(AgentEvent("skill", {"name": name, "trigger": "manual"}))
+            on_event(AgentEvent("ended", {"stop_reason": "completed", "turns": 1}))
 
     def context_snapshot(self) -> ContextSnapshot:
         return ContextSnapshot(
@@ -258,6 +271,28 @@ async def _status_bar_is_visible_on_launch(tmp_path: Path) -> None:
 
 def test_context_command_shows_budget_details(tmp_path: Path) -> None:
     asyncio.run(_context_command_shows_budget_details(tmp_path))
+
+
+def test_skill_command_activates_discovered_skill(tmp_path: Path) -> None:
+    asyncio.run(_skill_command_activates_discovered_skill(tmp_path))
+
+
+async def _skill_command_activates_discovered_skill(tmp_path: Path) -> None:
+    agent = FakeAgent(tmp_path, [])
+    agent._skill_infos = [
+        SimpleNamespace(name="test-first", description="Use when changing tested behavior")
+    ]
+    app = AnvilApp(agent)
+    async with app.run_test(size=(110, 26)) as pilot:
+        _set_composer(app, "/skill:test-first add parser")
+        await pilot.press("enter")
+        for _ in range(40):
+            if not app._busy:
+                break
+            await pilot.pause(0.05)
+        assert agent.skill_runs == [("test-first", "add parser")]
+        notices = [_plain(child) for child in app.query(NoticeBlock)]
+        assert any("test-first" in text for text in notices)
 
 
 async def _context_command_shows_budget_details(tmp_path: Path) -> None:

@@ -11,6 +11,7 @@ SLASH_COMMANDS: tuple[tuple[str, str], ...] = (
     ("status", "模型、会话与 token"),
     ("context", "查看当前上下文占用"),
     ("compact", "压缩旧上下文，可附保留重点"),
+    ("skills", "查看项目 Skills"),
     ("effort", "思考强度 off/low/high/max"),
     ("perm", "权限 ask/auto"),
     ("clear", "开始新会话"),
@@ -69,13 +70,19 @@ def slash_query(text: str) -> str | None:
     return text[1:]
 
 
-def match_slash(text: str) -> list[Suggestion] | None:
+def match_slash(
+    text: str,
+    skills: tuple[tuple[str, str], ...] = (),
+) -> list[Suggestion] | None:
     effort_args = match_effort_args(text)
     if effort_args is not None:
         return effort_args
     perm_args = match_perm_args(text)
     if perm_args is not None:
         return perm_args
+    skill_args = match_skill_args(text, skills)
+    if skill_args is not None:
+        return skill_args
     query = slash_query(text)
     if query is None:
         return None
@@ -97,6 +104,20 @@ def match_slash(text: str) -> list[Suggestion] | None:
                 Suggestion("slash", target, f"/{target}", details.get(target, ""))
             )
     return items
+
+
+def match_skill_args(
+    text: str,
+    skills: tuple[tuple[str, str], ...],
+) -> list[Suggestion] | None:
+    if "\n" in text or " " in text or not text.lower().startswith("/skill:"):
+        return None
+    needle = text[len("/skill:") :].lower()
+    return [
+        Suggestion("slash", f"skill:{name}", f"/skill:{name}", description)
+        for name, description in skills
+        if not needle or name.startswith(needle)
+    ]
 
 
 def effort_suggestions(current: str) -> list[Suggestion]:

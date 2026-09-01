@@ -54,6 +54,7 @@ def _config(workspace: Path) -> Config:
 
 def test_needs_ask_skips_reads_and_auto_mode() -> None:
     assert needs_ask("ask", "read_file") is False
+    assert needs_ask("ask", "load_skill") is False
     assert needs_ask("ask", "edit_file") is True
     assert needs_ask("auto", "edit_file") is False
     assert needs_ask("ask", "edit_file", {"edit_file"}) is False

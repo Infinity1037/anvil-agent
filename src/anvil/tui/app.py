@@ -47,6 +47,7 @@ from anvil.ui.format import (
     compact_result_text,
     context_badge,
     context_report,
+    skills_report,
     strip_internal,
     tool_message_ok,
 )
@@ -360,7 +361,10 @@ class AnvilApp(App[None]):
         if self._hold_suggest and not (text or "").strip():
             return
         self._hold_suggest = False
-        slash = match_slash(text)
+        getter = getattr(self.agent, "skill_infos", None)
+        infos = getter() if callable(getter) else ()
+        skills = tuple((item.name, item.description) for item in infos)
+        slash = match_slash(text, skills)
         if slash is not None:
             listing.set_items(slash)
             self._refresh_status()
@@ -453,6 +457,27 @@ class AnvilApp(App[None]):
             return True
         if name == "compact":
             self._start_manual_compaction(arg)
+            return True
+        if name == "skills":
+            store = self.agent.session.skills
+            log = self.query_one("#log", VerticalScroll)
+            log.mount(
+                NoticeBlock(
+                    skills_report(
+                        self.agent.skill_infos(),
+                        set(self.agent.session.active_skills),
+                        store.issues,
+                    )
+                )
+            )
+            log.scroll_end(animate=False)
+            return True
+        if name.startswith("skill:"):
+            skill_name = name[len("skill:") :].strip()
+            if not skill_name:
+                return False
+            shown = f"/skill:{skill_name}" + (f" {arg}" if arg else "")
+            self._submit(arg, display_text=shown, skill=skill_name)
             return True
         if name == "help":
             self.action_show_help()
@@ -742,9 +767,9 @@ class AnvilApp(App[None]):
         log.scroll_end(animate=False)
         self._refresh_status()
 
-    def _submit(self, text: str) -> None:
+    def _submit(self, text: str, *, display_text: str | None = None, skill: str = "") -> None:
         log = self.query_one("#log", VerticalScroll)
-        log.mount(UserBlock(text))
+        log.mount(UserBlock(display_text if display_text is not None else text))
         self._thinking = None
         self._assistant = None
         self._tools = {}
@@ -752,13 +777,21 @@ class AnvilApp(App[None]):
         self._disarm_quit()
         self._set_busy(True)
         log.scroll_end(animate=False)
-        self._run_agent(text)
+        self._run_agent(text, skill)
 
     @work(thread=True, exclusive=True)
-    def _run_agent(self, text: str) -> None:
+    def _run_agent(self, text: str, skill: str = "") -> None:
         self.agent.session.cancel.clear()
         try:
-            self.agent.run(text, on_event=self._bridge.push, cancel=self.agent.session.cancel)
+            if skill:
+                self.agent.run_skill(
+                    skill,
+                    text,
+                    on_event=self._bridge.push,
+                    cancel=self.agent.session.cancel,
+                )
+            else:
+                self.agent.run(text, on_event=self._bridge.push, cancel=self.agent.session.cancel)
         except Exception as exc:
             try:
                 self.call_from_thread(
@@ -873,6 +906,8 @@ class AnvilApp(App[None]):
                         "已折叠较早的上下文（完整记录仍在本工作区会话文件中）"
                     )
                 )
+        elif kind == "skill":
+            log.mount(NoticeBlock(f"已激活项目 Skill：{payload.get('name')}"))
         elif kind == "error":
             log.mount(NoticeBlock(str(payload.get("message") or "error"), style="bold red"))
         elif kind == "ended":

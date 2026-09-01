@@ -18,6 +18,7 @@ STOP_LABELS = {
     "length": "Stopped: model output truncated",
     "llm_error": "Model request failed",
     "context_overflow": "Stopped: request exceeds the context budget",
+    "skill_error": "Project Skill could not be activated",
 }
 
 
@@ -53,6 +54,7 @@ def context_report(snapshot: "ContextSnapshot", usage: "Usage") -> str:
         f"context {context_badge(snapshot).removeprefix('ctx ')}\n"
         f"remaining ≈{short_tokens(snapshot.remaining_tokens)} tokens\n"
         f"messages {snapshot.history_messages} full / {snapshot.view_messages} active\n"
+        f"skills {snapshot.active_skills} active\n"
         f"{checkpoint}\n"
         f"estimate {estimate}\n"
         f"API tokens this process "
@@ -77,6 +79,24 @@ def compact_result_text(result: "CompactResult") -> str:
         return "当前任务仍在运行；请等待结束后再压缩上下文"
     detail = (result.error or "unknown error").strip()[:500]
     return f"上下文压缩失败：{detail}\n原 checkpoint 保持不变"
+
+
+def skills_report(infos, active: set[str] | None = None, issues: tuple[str, ...] = ()) -> str:
+    active = active or set()
+    rows = list(infos)
+    if not rows:
+        text = "当前项目没有可用 Skill（目录：.agents/skills/<name>/SKILL.md）"
+    else:
+        lines = [f"project skills {len(rows)}"]
+        for item in rows:
+            marker = "  active" if item.name in active else ""
+            if not getattr(item, "model_invocable", True):
+                marker += "  manual"
+            lines.append(f"- {item.name}{marker}: {item.description}")
+        text = "\n".join(lines)
+    if issues:
+        text += f"\nignored invalid skills: {len(issues)}（重启会话后重新发现）"
+    return text
 
 
 def tool_message_ok(content: str) -> bool:

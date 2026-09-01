@@ -4,7 +4,7 @@ import json
 from dataclasses import dataclass, field
 from threading import Event, Lock
 
-from anvil.agent.context import ContextManager, ContextSnapshot, normalize_summary
+from anvil.agent.context import ContextManager, ContextSnapshot, PinnedContext, normalize_summary
 from anvil.agent.permissions import ApprovalDecision, needs_ask
 from anvil.config import Config
 from anvil.events import AgentEvent, EventCallback, emit
@@ -13,6 +13,7 @@ from anvil.llm.types import Message, ToolCall, Usage
 from anvil.session import Session
 from anvil.tools.base import ToolRegistry
 from anvil.tools.result import ToolResult
+from anvil.tools.skills import make_load_skill
 
 REPEAT_WARN = 3
 REPEAT_STOP = 5
@@ -52,6 +53,7 @@ class Agent:
         self.tools = tools
         self.context = context
         self.session = session or Session(config)
+        self.tools.register(make_load_skill(self.session.skills))
         self.approver = None
         self._repeat_counts: dict[str, int] = {}
         self._compaction_attempts = 0
@@ -68,6 +70,36 @@ class Agent:
 
     def context_snapshot(self) -> ContextSnapshot:
         return self.context.snapshot(self.session.messages)
+
+    def skill_infos(self):
+        return self.session.skills.skills
+
+    def run_skill(
+        self,
+        name: str,
+        task: str = "",
+        on_event: EventCallback | None = None,
+        cancel: Event | None = None,
+    ) -> RunResult:
+        """Activate one project Skill at an idle boundary, then run its task."""
+        with self._operation_lock:
+            flag = cancel or self.session.cancel
+            flag.clear()
+            loaded = self.session.skills.load(name, task)
+            if not loaded.ok:
+                text = loaded.to_message_content()
+                emit(on_event, "error", {"message": text})
+                return RunResult(text, 0, "skill_error")
+            token = (name or "").strip().lower()
+            source = Message(role="user", content=loaded.content)
+            if not self.session.append_skill_source(source, token, loaded.content):
+                text = "Stopped: the Skill activation could not be persisted or exceeds its budget."
+                emit(on_event, "error", {"message": text})
+                return RunResult(text, 0, "skill_error")
+            self._restore_skill_pins()
+            emit(on_event, "skill", {"name": token, "trigger": "manual"})
+            request = task.strip() or "Apply the activated project skill now."
+            return self._run(request, on_event=on_event, cancel=flag)
 
     def compact(
         self,
@@ -111,11 +143,13 @@ class Agent:
     def new_session(self) -> None:
         self.session.start_new()
         self.context.reset()
+        self.tools.register(make_load_skill(self.session.skills))
         self.reset_turn_state(clear_observer=True)
 
     def attach_session(self, session: Session) -> None:
         self.session = session
         self.context.reset()
+        self.tools.register(make_load_skill(self.session.skills))
         self._restore_context_checkpoint()
         self.reset_turn_state(clear_observer=True)
 
@@ -216,11 +250,26 @@ class Agent:
                 if _cancelled(flag) or result.error_code == "cancelled":
                     self._append_tool(call, result, on_event)
                     return self._stop("cancelled", turn, "Stopped: cancelled.", on_event)
-                text = self.context.ingest_tool_result(
-                    result.to_message_content(), call_id=call.id
-                )
+                is_skill = call.name == "load_skill" and result.ok
+                raw = result.to_message_content()
+                text = raw if is_skill else self.context.ingest_tool_result(raw, call_id=call.id)
                 text, halt = self._note_repeated_call(call, text)
-                self.session.append(Message(role="tool", content=text, tool_call_id=call.id))
+                message = Message(role="tool", content=text, tool_call_id=call.id)
+                if is_skill:
+                    name = str(call.arguments.get("name") or "").strip().lower()
+                    if self.session.append_skill_source(message, name, text):
+                        self._restore_skill_pins()
+                        emit(on_event, "skill", {"name": name, "trigger": "model"})
+                    else:
+                        result = ToolResult.fail(
+                            "skill_activation_failed",
+                            "Skill activation could not be persisted or exceeds its budget.",
+                        )
+                        text = result.to_message_content()
+                        message = Message(role="tool", content=text, tool_call_id=call.id)
+                        self.session.append(message)
+                else:
+                    self.session.append(message)
                 emit(
                     on_event,
                     "tool_result",
@@ -365,6 +414,14 @@ class Agent:
         item = getattr(self.session, "compaction", None)
         if item is not None:
             self.context.restore_checkpoint(item.summary, item.covered_count)
+        self._restore_skill_pins()
+
+    def _restore_skill_pins(self) -> None:
+        pins = [
+            PinnedContext(item.name, item.content, item.source_index)
+            for item in self.session.active_skills.values()
+        ]
+        self.context.set_skill_pins(pins)
 
     def _execute_calls(self, calls: list[ToolCall], flag: Event | None) -> list[ToolResult]:
         mode = getattr(self.session, "permission_mode", "ask")

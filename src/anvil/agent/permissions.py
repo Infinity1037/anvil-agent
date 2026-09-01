@@ -11,6 +11,7 @@ READ_ONLY_TOOLS = {
     "glob",
     "grep",
     "read_file",
+    "load_skill",
     "todo",
 }
 

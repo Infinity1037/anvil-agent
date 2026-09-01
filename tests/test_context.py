@@ -1,6 +1,7 @@
 from anvil.agent.context import (
     PLACEHOLDER,
     ContextManager,
+    PinnedContext,
     clip_text,
     estimate_tokens,
     normalize_summary,
@@ -183,6 +184,105 @@ def test_context_snapshot_reports_active_view_and_checkpoint() -> None:
     assert snapshot.covered_count == request.covered_count
     assert snapshot.estimated_tokens > 0
     assert snapshot.remaining_tokens == snapshot.budget - snapshot.estimated_tokens
+
+
+def test_active_skill_is_reattached_after_checkpoint_cut() -> None:
+    messages = [
+        Message(role="system", content="system"),
+        Message(role="user", content="skill instructions ANCHOR-RULE"),
+        Message(role="assistant", content="used the skill"),
+        Message(role="user", content="continue"),
+    ]
+    manager = ContextManager(budget=20_000)
+    manager.set_skill_pins(
+        [PinnedContext("test-first", "skill instructions ANCHOR-RULE", 1)]
+    )
+    assert manager.apply_summary("goal summary", 3)
+
+    view = manager.prepare(messages, preserve_history=True)
+    assert any("ANCHOR-RULE" in (message.content or "") for message in view)
+    assert manager.snapshot(messages).active_skills == 1
+
+
+def test_active_skill_survives_cheap_tool_result_folding() -> None:
+    messages = [Message(role="system", content="system")]
+    for index in range(8):
+        messages.extend(
+            [
+                Message(
+                    role="assistant",
+                    content="",
+                    tool_calls=[
+                        ToolCall(
+                            id=f"call-{index}",
+                            name="load_skill" if index == 0 else "read_file",
+                            arguments={"name": "test-first"},
+                            arguments_raw='{"name":"test-first"}',
+                        )
+                    ],
+                ),
+                Message(
+                    role="tool",
+                    content=(
+                        "skill instructions CHEAP-FOLD-ANCHOR"
+                        if index == 0
+                        else "x" * 3_000
+                    ),
+                    tool_call_id=f"call-{index}",
+                ),
+            ]
+        )
+    manager = ContextManager(budget=5_000)
+    manager.set_skill_pins(
+        [PinnedContext("test-first", "skill instructions CHEAP-FOLD-ANCHOR", 2)]
+    )
+
+    view = manager.prepare(messages, preserve_history=True)
+    assert any("CHEAP-FOLD-ANCHOR" in (message.content or "") for message in view)
+
+
+def test_unrelated_substring_does_not_impersonate_a_skill_pin() -> None:
+    messages = [
+        Message(role="system", content="system"),
+        Message(role="user", content="start"),
+        Message(role="assistant", content="ready"),
+    ]
+    messages.extend(
+        [
+            Message(
+                role="assistant",
+                content="",
+                tool_calls=[
+                    ToolCall(
+                        id="skill-call",
+                        name="load_skill",
+                        arguments={"name": "test-first"},
+                        arguments_raw='{"name":"test-first"}',
+                    )
+                ],
+            ),
+            Message(role="tool", content="Run tests.", tool_call_id="skill-call"),
+        ]
+    )
+    for index in range(7):
+        messages.extend(
+            [
+                Message(role="user", content=f"ordinary note {index}: Run tests. after edits"),
+                Message(role="assistant", content="x" * 3_000),
+            ]
+        )
+    manager = ContextManager(budget=5_000)
+    manager.set_skill_pins([PinnedContext("test-first", "Run tests.", 4)])
+
+    view = manager.prepare(messages, preserve_history=False)
+
+    retained = [
+        message.content or ""
+        for message in view
+        if (message.content or "").startswith("[Active project skill 'test-first' retained ")
+    ]
+    assert len(retained) == 1
+    assert retained[0].endswith("\nRun tests.")
 
 
 def test_compaction_focus_is_bounded_and_cannot_close_prompt_tags() -> None:

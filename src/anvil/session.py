@@ -12,9 +12,11 @@ from pathlib import Path
 from anvil.agent.prompts import build_system_prompt, prompt_date
 from anvil.config import Config
 from anvil.llm.types import Message, Usage
+from anvil.skills import SkillStore
 from anvil.tools.todo import TodoStore
 
 SESSIONS_DIR = ".anvil/sessions"
+MAX_ACTIVE_SKILLS = 4
 
 
 def _new_id() -> str:
@@ -56,13 +58,35 @@ class CompactionCheckpoint:
         }
 
 
+@dataclass(frozen=True)
+class SkillActivation:
+    name: str
+    content: str
+    source_index: int
+    source_hash: str
+
+    def to_record(self) -> dict:
+        return {
+            "type": "skill_activation",
+            "name": self.name,
+            "content": self.content,
+            "source_index": self.source_index,
+            "source_hash": self.source_hash,
+        }
+
+
 class Session:
     """Owns conversation history. The model sees a compacted view; this log stays complete.
 
     Transcripts live in the workspace: `.anvil/sessions/<id>.jsonl`.
     """
 
-    def __init__(self, config: Config, todo: TodoStore | None = None) -> None:
+    def __init__(
+        self,
+        config: Config,
+        todo: TodoStore | None = None,
+        skills: SkillStore | None = None,
+    ) -> None:
         self.config = config
         self.todo = todo or TodoStore()
         self.usage = Usage()
@@ -74,15 +98,26 @@ class Session:
         self.permission_mode = "ask"
         self.session_allow: set[str] = set()
         self.compaction: CompactionCheckpoint | None = None
+        self.skills = skills or SkillStore(config.workspace)
+        self.active_skills: dict[str, SkillActivation] = {}
         self._created = datetime.now(timezone.utc).isoformat()
         self.messages: list[Message] = [
-            Message(role="system", content=build_system_prompt(config.workspace))
+            Message(
+                role="system",
+                content=build_system_prompt(config.workspace, skills=self.skills),
+            )
         ]
         self._write_meta()
         self._write(self.messages[0])
 
     @classmethod
-    def load(cls, config: Config, path: Path, todo: TodoStore | None = None) -> Session:
+    def load(
+        cls,
+        config: Config,
+        path: Path,
+        todo: TodoStore | None = None,
+        skills: SkillStore | None = None,
+    ) -> Session:
         session = cls.__new__(cls)
         session.config = config
         session.todo = todo or TodoStore()
@@ -95,9 +130,11 @@ class Session:
         session.permission_mode = "ask"
         session.session_allow = set()
         session.compaction = None
+        session.skills = skills or SkillStore(config.workspace)
+        session.active_skills = {}
         session._created = _header_created(path)
         session.messages = []
-        meta_id, messages, settings, compaction = _read_session_data(path)
+        meta_id, messages, settings, compaction, activations = _read_session_data(path)
         if meta_id:
             session.id = meta_id
         if "thinking" in settings:
@@ -107,14 +144,28 @@ class Session:
         if settings.get("permission_mode") in {"ask", "auto"}:
             session.permission_mode = str(settings["permission_mode"])
         if not messages:
-            session.messages = [Message(role="system", content=build_system_prompt(config.workspace))]
+            session.messages = [
+                Message(
+                    role="system",
+                    content=build_system_prompt(config.workspace, skills=session.skills),
+                )
+            ]
         else:
             session.messages = messages
             if session.messages[0].role != "system":
                 session.messages.insert(
-                    0, Message(role="system", content=build_system_prompt(config.workspace))
+                    0,
+                    Message(
+                        role="system",
+                        content=build_system_prompt(config.workspace, skills=session.skills),
+                    ),
                 )
         session.compaction = _valid_compaction(compaction, session.messages)
+        session.active_skills = _valid_skill_activations(
+            activations,
+            session.messages,
+            session._active_skill_char_budget(),
+        )
         session._refresh_system()
         return session
 
@@ -128,16 +179,40 @@ class Session:
         self.permission_mode = "ask"
         self.session_allow = set()
         self.compaction = None
+        self.active_skills = {}
+        self.skills.refresh()
         self.id = _new_id()
         self._created = datetime.now(timezone.utc).isoformat()
         self._log_path = sessions_dir(self.config.workspace) / f"{self.id}.jsonl"
-        self.messages = [Message(role="system", content=build_system_prompt(self.config.workspace))]
+        self.messages = [
+            Message(
+                role="system",
+                content=build_system_prompt(self.config.workspace, skills=self.skills),
+            )
+        ]
         self._write_meta()
         self._write(self.messages[0])
 
     def append(self, message: Message) -> None:
         self.messages.append(message)
         self._write(message)
+
+    def append_skill_source(self, message: Message, name: str, content: str) -> bool:
+        """Persist a source message and its activation before publishing either in memory."""
+        if not self.can_activate_skill(name, content):
+            return False
+        source_index = len(self.messages)
+        item = SkillActivation(
+            name=name,
+            content=content,
+            source_index=source_index,
+            source_hash=_message_hash(message),
+        )
+        if not self._append_json_rows([message.to_record(), item.to_record()]):
+            return False
+        self.messages.append(message)
+        self.active_skills[name] = item
+        return True
 
     def set_effort(self, token: str) -> str:
         from anvil.config import apply_effort_token
@@ -190,6 +265,20 @@ class Session:
         self.compaction = item
         return item
 
+    def can_activate_skill(self, name: str, content: str) -> bool:
+        if not name or not content:
+            return False
+        latest = dict(self.active_skills)
+        latest[name] = SkillActivation(name, content, 1, "pending")
+        return (
+            len(latest) <= MAX_ACTIVE_SKILLS
+            and sum(len(item.content) for item in latest.values())
+            <= self._active_skill_char_budget()
+        )
+
+    def _active_skill_char_budget(self) -> int:
+        return max(2_000, min(60_000, int(self.config.context_budget * 0.6)))
+
     def permission_status(self) -> str:
         return f"perm {self.permission_mode}"
 
@@ -204,7 +293,11 @@ class Session:
         captured = prompt_date(old.content or "") if old else None
         fresh = Message(
             role="system",
-            content=build_system_prompt(self.config.workspace, now=captured),
+            content=build_system_prompt(
+                self.config.workspace,
+                now=captured,
+                skills=self.skills,
+            ),
         )
         if old is None:
             self.messages.insert(0, fresh)
@@ -236,6 +329,7 @@ class Session:
             ]
             if self.compaction is not None:
                 rows.append(self.compaction.to_record())
+            rows.extend(item.to_record() for item in self.active_skills.values())
             with tmp.open("w", encoding="utf-8") as handle:
                 for payload in rows:
                     handle.write(json.dumps(payload, ensure_ascii=False) + "\n")
@@ -271,11 +365,14 @@ class Session:
         )
 
     def _append_json(self, payload: dict) -> bool:
+        return self._append_json_rows([payload])
+
+    def _append_json_rows(self, payloads: list[dict]) -> bool:
         try:
             self._log_path.parent.mkdir(parents=True, exist_ok=True)
-            line = json.dumps(payload, ensure_ascii=False) + "\n"
             with self._log_path.open("a", encoding="utf-8") as handle:
-                handle.write(line)
+                for payload in payloads:
+                    handle.write(json.dumps(payload, ensure_ascii=False) + "\n")
                 handle.flush()
                 os.fsync(handle.fileno())
         except OSError:
@@ -296,21 +393,28 @@ def _header_created(path: Path) -> str:
 
 
 def read_session_file(path: Path) -> tuple[str | None, list[Message], dict]:
-    meta_id, messages, settings, _compaction = _read_session_data(path)
+    meta_id, messages, settings, _compaction, _activations = _read_session_data(path)
     return meta_id, messages, settings
 
 
 def _read_session_data(
     path: Path,
-) -> tuple[str | None, list[Message], dict, list[CompactionCheckpoint]]:
+) -> tuple[
+    str | None,
+    list[Message],
+    dict,
+    list[CompactionCheckpoint],
+    list[SkillActivation],
+]:
     meta_id: str | None = None
     messages: list[Message] = []
     settings: dict = {}
     compactions: list[CompactionCheckpoint] = []
+    activations: list[SkillActivation] = []
     try:
         text = path.read_text(encoding="utf-8")
     except OSError:
-        return None, [], {}, []
+        return None, [], {}, [], []
     for raw in text.splitlines():
         line = raw.strip()
         if not line:
@@ -339,10 +443,15 @@ def _read_session_data(
             if item is not None:
                 compactions.append(item)
             continue
+        if payload.get("type") == "skill_activation":
+            item = _skill_activation_from_record(payload)
+            if item is not None:
+                activations.append(item)
+            continue
         message = Message.from_record(payload)
         if message is not None:
             messages.append(message)
-    return meta_id or None, messages, settings, compactions
+    return meta_id or None, messages, settings, compactions, activations
 
 
 def _checkpoint_from_record(payload: dict) -> CompactionCheckpoint | None:
@@ -379,10 +488,57 @@ def _valid_compaction(
     return None
 
 
+def _skill_activation_from_record(payload: dict) -> SkillActivation | None:
+    name = payload.get("name")
+    content = payload.get("content")
+    source_hash = payload.get("source_hash")
+    try:
+        source_index = int(payload.get("source_index") or 0)
+    except (TypeError, ValueError):
+        return None
+    if not all(isinstance(value, str) and value for value in (name, content, source_hash)):
+        return None
+    return SkillActivation(name, content, source_index, source_hash)
+
+
+def _valid_skill_activations(
+    candidates: list[SkillActivation],
+    messages: list[Message],
+    char_budget: int,
+) -> dict[str, SkillActivation]:
+    valid: dict[str, SkillActivation] = {}
+    for item in candidates:
+        if item.source_index <= 0 or item.source_index >= len(messages):
+            continue
+        source = messages[item.source_index]
+        if item.source_hash != _message_hash(source):
+            continue
+        if item.content != (source.content or ""):
+            continue
+        next_items = dict(valid)
+        next_items[item.name] = item
+        if len(next_items) > MAX_ACTIVE_SKILLS:
+            continue
+        if sum(len(value.content) for value in next_items.values()) > char_budget:
+            continue
+        valid = next_items
+    return valid
+
+
 def _messages_hash(messages: list[Message], covered_count: int) -> str:
     rows = [message.to_record() for message in messages[1:covered_count]]
     encoded = json.dumps(
         rows,
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+    ).encode("utf-8")
+    return hashlib.sha256(encoded).hexdigest()
+
+
+def _message_hash(message: Message) -> str:
+    encoded = json.dumps(
+        message.to_record(),
         ensure_ascii=False,
         sort_keys=True,
         separators=(",", ":"),

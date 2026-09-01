@@ -51,6 +51,25 @@ def test_prompt_includes_anvil_md(tmp_path: Path) -> None:
     assert "use python -m unittest" in text
 
 
+def test_prompt_lists_only_project_skill_metadata(tmp_path: Path) -> None:
+    folder = tmp_path / ".agents" / "skills" / "review-code"
+    folder.mkdir(parents=True)
+    (folder / "SKILL.md").write_text(
+        "---\n"
+        "name: review-code\n"
+        "description: Use when reviewing source changes.\n"
+        "---\n"
+        "PRIVATE REVIEW CHECKLIST\n",
+        encoding="utf-8",
+    )
+    text = _prompt(tmp_path)
+    assert "# Project skills" in text
+    assert '"name":"review-code"' in text
+    assert "Use when reviewing source changes" in text
+    assert "PRIVATE REVIEW CHECKLIST" not in text
+    assert "never grants tool permission" in text
+
+
 def test_prompt_caps_instruction_file_length(tmp_path: Path) -> None:
     (tmp_path / "AGENTS.md").write_text("X" * (INSTRUCTION_CHAR_LIMIT + 50), encoding="utf-8")
     text = _prompt(tmp_path)

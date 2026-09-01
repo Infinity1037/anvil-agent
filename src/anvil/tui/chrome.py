@@ -45,6 +45,8 @@ HELP_TEXT = """\
   /status        模型、会话与 token
   /context       查看模型视图、预算与 checkpoint
   /compact [重点] 手动压缩旧上下文
+  /skills        查看项目 Skills
+  /skill:<名称>  激活 Skill，可附任务文本
   /effort        选择思考强度（off / low / high / max）
   /perm          权限 ask（改前确认）/ auto（不问）
   /clear         开始新会话（工作区不变）

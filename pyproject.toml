@@ -11,6 +11,7 @@ dependencies = [
     "rich>=13.7",
     "prompt-toolkit>=3.0",
     "textual>=8.2,<9",
+    "PyYAML>=6.0",
 ]
 
 [project.optional-dependencies]
