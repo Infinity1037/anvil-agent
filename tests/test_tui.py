@@ -20,7 +20,14 @@ from anvil.tui.chrome import (
     SuggestList,
     status_plain,
 )
-from anvil.tui.widgets import AssistantBlock, FoldBlock, NoticeBlock, UserBlock
+from anvil.tui.widgets import (
+    AssistantBlock,
+    FoldBlock,
+    NoticeBlock,
+    UserBlock,
+    WelcomeBlock,
+    welcome_content,
+)
 
 
 def _composer(app: AnvilApp) -> Composer:
@@ -267,6 +274,65 @@ async def _status_bar_is_visible_on_launch(tmp_path: Path) -> None:
         assert "ask" in plain
         assert "ctx" in plain
         assert list(app.query("#header")) == []
+
+
+def test_welcome_content_stays_compact_and_adds_only_available_skills(tmp_path: Path) -> None:
+    body = welcome_content(
+        workspace=str(tmp_path),
+        model="deepseek-v4-flash",
+        effort="max",
+        perm="ask",
+        context="200k",
+        skills=1,
+    )
+
+    assert body.plain.splitlines() == [
+        "Local coding agent",
+        "",
+        str(tmp_path),
+        "deepseek-v4-flash  ·  max  ·  ask  ·  200k  ·  1 skill",
+    ]
+    assert "欢迎" not in body.plain
+    assert "/resume" not in body.plain
+
+
+def test_launch_uses_welcome_card_but_clear_does_not_repeat_it(tmp_path: Path) -> None:
+    asyncio.run(_launch_uses_welcome_card_but_clear_does_not_repeat_it(tmp_path))
+
+
+async def _launch_uses_welcome_card_but_clear_does_not_repeat_it(tmp_path: Path) -> None:
+    agent = FakeAgent(tmp_path, [])
+    app = AnvilApp(agent)
+    async with app.run_test(size=(100, 24)) as pilot:
+        await pilot.pause(0.05)
+        card = app.query_one(WelcomeBlock)
+        rendered = _plain(card)
+        assert "Local coding agent" in rendered
+        assert str(tmp_path) in rendered
+        assert "scripted" in rendered
+        assert "max  ·  ask  ·  200k" in rendered
+
+        _set_composer(app, "/clear")
+        await pilot.press("enter")
+        await pilot.pause(0.05)
+
+        assert list(app.query(WelcomeBlock)) == []
+        notices = [_plain(child) for child in app.query(NoticeBlock)]
+        assert notices == ["已开始新会话。"]
+
+
+def test_welcome_card_shrinks_inside_a_narrow_log(tmp_path: Path) -> None:
+    asyncio.run(_welcome_card_shrinks_inside_a_narrow_log(tmp_path))
+
+
+async def _welcome_card_shrinks_inside_a_narrow_log(tmp_path: Path) -> None:
+    app = AnvilApp(FakeAgent(tmp_path, []))
+    async with app.run_test(size=(48, 24)) as pilot:
+        await pilot.pause(0.05)
+        card = app.query_one(WelcomeBlock)
+        log = app.query_one("#log")
+        assert 0 < card.size.width <= log.size.width
+        assert card.size.height == 6
 
 
 def test_context_command_shows_budget_details(tmp_path: Path) -> None:

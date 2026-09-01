@@ -11,13 +11,13 @@ from textual.binding import Binding
 from textual.containers import VerticalScroll
 from textual.widgets import Static
 
+from anvil import __version__
 from anvil.agent.context import ContextSnapshot
 from anvil.agent.loop import Agent, CompactResult
 from anvil.events import AgentEvent
 from anvil.config import effort_label
 from anvil.agent.permissions import ApprovalDecision
 from anvil.tui.chrome import (
-    WELCOME_TEXT,
     ApprovalPanel,
     Composer,
     HelpScreen,
@@ -41,12 +41,19 @@ from anvil.tui.complete import (
     perm_suggestions,
 )
 from anvil.session import Session, find_session, list_sessions
-from anvil.tui.widgets import AssistantBlock, FoldBlock, NoticeBlock, UserBlock
+from anvil.tui.widgets import (
+    AssistantBlock,
+    FoldBlock,
+    NoticeBlock,
+    UserBlock,
+    WelcomeBlock,
+)
 from anvil.ui.format import (
     STOP_LABELS,
     compact_result_text,
     context_badge,
     context_report,
+    short_tokens,
     skills_report,
     strip_internal,
     tool_message_ok,
@@ -159,7 +166,7 @@ class AnvilApp(App[None]):
         log = self.query_one("#log", VerticalScroll)
         has_history = len(self.agent.messages) > 1
         if not self._initial and not has_history:
-            log.mount(NoticeBlock(WELCOME_TEXT))
+            log.mount(self._welcome_block())
         self.query_one("#composer", Composer).focus()
         self.agent.approver = self
         if self._initial:
@@ -555,9 +562,23 @@ class AnvilApp(App[None]):
         self._tools = {}
         self._expanded = False
         log.mount(NoticeBlock("已开始新会话。"))
-        log.mount(NoticeBlock(WELCOME_TEXT))
         self.action_suggest_hide()
         self._refresh_status()
+
+    def _welcome_block(self) -> WelcomeBlock:
+        config = self.agent.config
+        getter = getattr(self.agent, "skill_infos", None)
+        infos = getter() if callable(getter) else ()
+        context_window = int(getattr(config, "context_window", 200_000))
+        return WelcomeBlock(
+            version=__version__,
+            workspace=str(config.workspace),
+            model=str(config.model),
+            effort=self._effort_id(),
+            perm=self._perm_id(),
+            context=short_tokens(context_window),
+            skills=len(tuple(infos)),
+        )
 
     def _perm_id(self) -> str:
         return str(getattr(self.agent.session, "permission_mode", None) or "ask")

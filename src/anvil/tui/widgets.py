@@ -23,6 +23,78 @@ from anvil.tui.markdown import (
 _THINKING_SPINNER = "⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏"
 
 
+def welcome_content(
+    *,
+    workspace: str,
+    model: str,
+    effort: str,
+    perm: str,
+    context: str,
+    skills: int = 0,
+) -> Text:
+    """Compact startup identity and environment summary."""
+    body = Text(no_wrap=True, overflow="ellipsis")
+    body.append("Local coding agent", style="dim")
+    body.append("\n\n")
+    body.append(workspace, style="bold #67e8f9")
+    body.append("\n")
+    fields = [model, effort, perm, context]
+    if skills > 0:
+        fields.append(f"{skills} skill" + ("s" if skills != 1 else ""))
+    for index, field in enumerate(fields):
+        if index:
+            body.append("  ·  ", style="dim")
+        body.append(field)
+    return body
+
+
+class WelcomeBlock(Static):
+    """Scrollable startup card; it leaves the viewport as the transcript grows."""
+
+    DEFAULT_CSS = """
+    WelcomeBlock {
+        height: auto;
+        width: 92;
+        max-width: 100%;
+        margin: 0 0 1 0;
+        padding: 0 1;
+        background: #111111;
+        border: round #3a3a3a;
+        border-title-color: #67e8f9;
+        border-title-style: bold;
+    }
+    """
+
+    def __init__(
+        self,
+        *,
+        version: str,
+        workspace: str,
+        model: str,
+        effort: str,
+        perm: str,
+        context: str,
+        skills: int = 0,
+        **kwargs,
+    ) -> None:
+        super().__init__(
+            welcome_content(
+                workspace=workspace,
+                model=model,
+                effort=effort,
+                perm=perm,
+                context=context,
+                skills=skills,
+            ),
+            markup=False,
+            **kwargs,
+        )
+        self.border_title = Text.assemble(
+            (" ANVIL ", "bold #67e8f9"),
+            (f" v{version} ", "dim"),
+        )
+
+
 class FoldBlock(Static):
     """Transcript card whose body grows/shrinks in place when expanded changes."""
 

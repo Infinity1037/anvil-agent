@@ -57,9 +57,6 @@ HELP_TEXT = """\
 Esc 或 q 关闭
 """
 
-WELCOME_TEXT = "会在当前工作区读文件、改代码、跑命令。/clear 新会话  ·  /effort 思考强度  ·  /perm 权限  ·  /resume 恢复  ·  键位见下方。"
-
-
 def session_header(
     *,
     model: str,
