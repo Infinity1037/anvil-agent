@@ -761,6 +761,117 @@ def test_fifth_identical_call_stops_with_no_progress(tmp_path: Path) -> None:
     assert any("repeated 5 times" in (m.content or "") for m in tool_messages)
 
 
+def test_successful_edit_starts_a_new_repeat_progress_phase(tmp_path: Path) -> None:
+    (tmp_path / "app.py").write_text("value = 1\n", encoding="utf-8")
+    shell = LLMResponse(
+        content="",
+        reasoning_content="",
+        tool_calls=[
+            ToolCall(
+                id="test",
+                name="run_shell",
+                arguments={"command": 'python -c "print(\'ok\')"'},
+                arguments_raw='{"command":"python -c \\"print(\'ok\')\\""}',
+            )
+        ],
+    )
+    read = LLMResponse(
+        content="",
+        reasoning_content="",
+        tool_calls=[
+            ToolCall(
+                id="read",
+                name="read_file",
+                arguments={"path": "app.py"},
+                arguments_raw='{"path":"app.py"}',
+            )
+        ],
+    )
+    edit = LLMResponse(
+        content="",
+        reasoning_content="",
+        tool_calls=[
+            ToolCall(
+                id="edit",
+                name="edit_file",
+                arguments={
+                    "path": "app.py",
+                    "old_string": "value = 1",
+                    "new_string": "value = 2",
+                },
+                arguments_raw=(
+                    '{"path":"app.py","old_string":"value = 1",'
+                    '"new_string":"value = 2"}'
+                ),
+            )
+        ],
+    )
+    done = LLMResponse(content="done", reasoning_content="", tool_calls=[])
+    llm = ScriptedLLM([shell, shell, read, edit, shell, shell, shell, done])
+    agent = Agent(
+        _config(tmp_path),
+        llm,
+        build_tools(tmp_path, TodoStore(), 5),
+        ContextManager(20_000),
+    )
+
+    result = agent.run("change it and keep testing")
+
+    assert result.stop_reason == "completed"
+    assert (tmp_path / "app.py").read_text(encoding="utf-8") == "value = 2\n"
+    tool_messages = [m for m in agent.messages if m.role == "tool"]
+    assert not any("repeated 5 times" in (m.content or "") for m in tool_messages)
+    assert sum("repeated 3 times" in (m.content or "") for m in tool_messages) == 1
+
+
+def test_failed_edit_does_not_reset_repeat_progress(tmp_path: Path) -> None:
+    (tmp_path / "app.py").write_text("value = 1\n", encoding="utf-8")
+    shell = LLMResponse(
+        content="",
+        reasoning_content="",
+        tool_calls=[
+            ToolCall(
+                id="test",
+                name="run_shell",
+                arguments={"command": 'python -c "print(\'ok\')"'},
+                arguments_raw='{"command":"python -c \\"print(\'ok\')\\""}',
+            )
+        ],
+    )
+    failed_edit = LLMResponse(
+        content="",
+        reasoning_content="",
+        tool_calls=[
+            ToolCall(
+                id="edit",
+                name="edit_file",
+                arguments={
+                    "path": "app.py",
+                    "old_string": "missing",
+                    "new_string": "value = 2",
+                },
+                arguments_raw=(
+                    '{"path":"app.py","old_string":"missing",'
+                    '"new_string":"value = 2"}'
+                ),
+            )
+        ],
+    )
+    llm = ScriptedLLM([shell, shell, failed_edit, shell, shell, shell])
+    agent = Agent(
+        _config(tmp_path),
+        llm,
+        build_tools(tmp_path, TodoStore(), 5),
+        ContextManager(20_000),
+    )
+
+    result = agent.run("keep retrying without changing anything")
+
+    assert result.stop_reason == "no_progress"
+    assert result.turns == 6
+    assert (tmp_path / "app.py").read_text(encoding="utf-8") == "value = 1\n"
+
+
 def test_new_user_message_resets_repeat_counts(tmp_path: Path) -> None:
     (tmp_path / "app.py").write_text("value = 1\n", encoding="utf-8")
     read = LLMResponse(

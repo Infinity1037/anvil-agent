@@ -212,8 +212,8 @@ def make_write_file(workspace: Path, observer: FileObserver | None = None) -> To
         if existed:
             diff = unified_diff(path, before, content)
             if diff:
-                return ToolResult.success(header + "\n" + diff)
-        return ToolResult.success(header)
+                return ToolResult.success(header + "\n" + diff, state_changed=True)
+        return ToolResult.success(header, state_changed=not existed)
 
     return ToolSpec(
         name="write_file",
@@ -293,7 +293,10 @@ def make_edit_file(workspace: Path, observer: FileObserver | None = None) -> Too
         if observer is not None:
             observer.remember(target, updated)
         diff = unified_diff(path, text, updated)
-        return ToolResult.success(f"Edited {path} (1 replacement).\n{diff}")
+        return ToolResult.success(
+            f"Edited {path} (1 replacement).\n{diff}",
+            state_changed=True,
+        )
 
     return ToolSpec(
         name="edit_file",

@@ -56,18 +56,22 @@ def test_edit_requires_unique_match(tmp_path: Path) -> None:
     assert missing.error_code == "no_match"
     assert "not found" in missing.content
 
-    ok = _text(registry.execute(_call("edit_file", path="app.py", old_string="y = 1", new_string="y = 2")))
-    assert "Edited" in ok
-    assert "--- a/app.py" in ok
-    assert "-y = 1" in ok
-    assert "+y = 2" in ok
+    edited = registry.execute(
+        _call("edit_file", path="app.py", old_string="y = 1", new_string="y = 2")
+    )
+    assert edited.state_changed is True
+    assert "Edited" in edited.content
+    assert "--- a/app.py" in edited.content
+    assert "-y = 1" in edited.content
+    assert "+y = 2" in edited.content
     assert "y = 2" in (tmp_path / "app.py").read_text(encoding="utf-8")
 
 
 def test_write_and_list(tmp_path: Path) -> None:
     registry = _registry(tmp_path)
-    written = _text(registry.execute(_call("write_file", path="pkg/hello.py", content="print(1)\n")))
-    assert "hello.py" in written
+    written = registry.execute(_call("write_file", path="pkg/hello.py", content="print(1)\n"))
+    assert written.state_changed is True
+    assert "hello.py" in written.content
     listed = _text(registry.execute(_call("list_dir", path="pkg")))
     assert "hello.py" in listed
 
@@ -91,8 +95,15 @@ def test_write_refuses_overwrite_without_flag(tmp_path: Path) -> None:
     assert (tmp_path / "a.txt").read_text(encoding="utf-8") == "one\n"
     replaced = registry.execute(_call("write_file", path="a.txt", content="two\n", overwrite=True))
     assert replaced.ok is True
+    assert replaced.state_changed is True
     assert (tmp_path / "a.txt").read_text(encoding="utf-8") == "two\n"
     assert "--- a/a.txt" in replaced.content
+
+    unchanged = registry.execute(
+        _call("write_file", path="a.txt", content="two\n", overwrite=True)
+    )
+    assert unchanged.ok is True
+    assert unchanged.state_changed is False
 
 
 def test_path_escape_is_an_error(tmp_path: Path) -> None:

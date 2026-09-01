@@ -253,6 +253,8 @@ class Agent:
                 is_skill = call.name == "load_skill" and result.ok
                 raw = result.to_message_content()
                 text = raw if is_skill else self.context.ingest_tool_result(raw, call_id=call.id)
+                if result.state_changed:
+                    self._repeat_counts.clear()
                 text, halt = self._note_repeated_call(call, text)
                 message = Message(role="tool", content=text, tool_call_id=call.id)
                 if is_skill:

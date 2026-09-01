@@ -11,10 +11,11 @@ class ToolResult:
     content: str
     error_code: str | None = None
     hint: str | None = None
+    state_changed: bool = False
 
     @classmethod
-    def success(cls, content: str) -> ToolResult:
-        return cls(ok=True, content=content)
+    def success(cls, content: str, *, state_changed: bool = False) -> ToolResult:
+        return cls(ok=True, content=content, state_changed=state_changed)
 
     @classmethod
     def fail(cls, error_code: str, content: str, hint: str | None = None) -> ToolResult:

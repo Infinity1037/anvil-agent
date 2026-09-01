@@ -13,11 +13,12 @@ loop:
     if no executable tool_calls: stop # 不盲信 finish_reason；仅 length 视为截断
     results = execute(tool_calls)     # ToolResult；只读可并行，写入/shell 串行
     append tool messages
-    if same call × 3: inject progress warning
-    if same call × 5: stop no_progress
+    if same call × 3 in one progress phase: inject warning
+    if same call × 5 in one progress phase: stop no_progress
+    successful write/edit starts a new progress phase
 ```
 
-停止条件：没有可执行的 tool_calls、输出截断、达到 `max_turns`、连续工具失败、同一调用重复五次、Ctrl+C。`finish_reason=stop` 但带了工具时仍执行；`finish_reason=tool_calls` 但工具列表为空时当作完成。
+停止条件：没有可执行的 tool_calls、输出截断、达到 `max_turns`、连续工具失败、同一进展阶段内相同调用重复五次、Ctrl+C。成功写入或编辑文件后重复计数清零，避免正常的“修改—复测”被误判；没有文件进展时仍会阻止空转。`finish_reason=stop` 但带了工具时仍执行；`finish_reason=tool_calls` 但工具列表为空时当作完成。
 
 ## 分层
 
@@ -38,7 +39,7 @@ loop:
 
 `list_dir` `glob` `grep` `read_file` `write_file` `edit_file` `run_shell` `todo`，以及仅在项目存在有效 Skill 时出现的只读 `load_skill`。
 
-- 失败返回 `ToolResult(ok=false, error_code, hint)`，不靠 `"Error:"` 前缀猜。错误码包括 `unknown_tool`、`invalid_json`、`missing_arguments`、`path_escape`、`secret_file`、`dangerous_command`、`command_failed`、`command_timeout`、`stale_read`、`not_unique`、`not_found` 等。
+- 失败返回 `ToolResult(ok=false, error_code, hint)`，不靠 `"Error:"` 前缀猜；成功的文件修改以 `state_changed` 明确通知循环开启新的进展阶段，不解析展示文本猜副作用。错误码包括 `unknown_tool`、`invalid_json`、`missing_arguments`、`path_escape`、`secret_file`、`dangerous_command`、`command_failed`、`command_timeout`、`stale_read`、`not_unique`、`not_found` 等。
 - `read_file` 记下文件摘要；`edit_file` 与覆盖写必须先读且摘要未变，否则 `stale_read`。
 - `edit_file`：精确唯一替换；0 次 / 多次匹配返回可恢复错误；成功时附 unified diff。
 - `write_file`：默认拒绝覆盖已有文件。
